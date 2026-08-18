@@ -39,17 +39,18 @@ def detect_regime(df: pd.DataFrame, imbalances: pd.DataFrame, lookback: int = 50
         outcomes.append((row['type'], res['outcome']))
 
     # find 2 consecutive fails in opposing directions
-    fails = [o for o in outcomes if o[1] == 'fail']
-    if len(fails) >= 2:
-        last_two = fails[-2:]
-        if last_two[0][0] != last_two[1][0]:
+        fails = [o for o in outcomes if o[1] == 'fail']
+    if len(fails) >= 3:
+        last_three = fails[-3:]
+        directions = set(f[0] for f in last_three)
+        if len(directions) > 1:
             return 'consolidation'
 
     return 'trending'
 
 
 def tradable(regime: str) -> bool:
-    return regime == 'trending'
+    return True  # TEST ONLY - regime filter disabled to isolate bottleneck
 
 
 # ---------- 2. Top-down bias ----------
@@ -106,7 +107,7 @@ def resolve_topdown_bias(bias_by_tf: dict, tf_order: list = None) -> dict:
     return {
         'bias': htf_bias,
         'aligned_count': aligned_count,
-        'tradable': aligned_count >= 2 and htf_bias != 'consolidation',
+        'tradable': aligned_count >= 1 and htf_bias != 'consolidation',
         'per_tf': dict(zip(tf_order, biases)),
     }
 

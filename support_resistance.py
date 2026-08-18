@@ -7,52 +7,44 @@ Depends on zigzag.py output.
 import numpy as np
 
 
-def find_sr_levels(swings, price_tolerance_pct=0.5, min_touches=2):
-    """
-    Cluster swing points into S/R levels.
-
-    Args:
-        swings: output from get_zigzag_swings()
-        price_tolerance_pct: % distance for two swings to count as same level
-        min_touches: minimum swings needed to confirm a level
-
-    Returns:
-        List of levels, sorted by strength (touches desc):
-        [{"price": float, "touches": int, "type": "SUPPORT"/"RESISTANCE"/"BOTH",
-          "indices": [int,...]}, ...]
-    """
+def find_sr_levels(swings, tolerance_pct=0.5):
     if not swings:
         return []
 
-    used = [False] * len(swings)
+    clusters = []  # each: {"prices": [...], "types": [...]}
+
+    for s in swings:
+        price = s["price"]
+        matched = None
+        for cl in clusters:
+            avg = sum(cl["prices"]) / len(cl["prices"])
+            if abs(price - avg) / avg * 100 <= tolerance_pct:
+                matched = cl
+                break
+        if matched:
+            matched["prices"].append(price)
+            matched["types"].append(s["type"])
+        else:
+            clusters.append({"prices": [price], "types": [s["type"]]})
+
     levels = []
+    for cl in clusters:
+        n_high = cl["types"].count("high")
+        n_low = cl["types"].count("low")
+        if n_low > n_high:
+            lvl_type = "SUPPORT"
+        elif n_high > n_low:
+            lvl_type = "RESISTANCE"
+        else:
+            lvl_type = "BOTH"
 
-    for i, s in enumerate(swings):
-        if used[i]:
-            continue
-        cluster = [i]
-        for j in range(i + 1, len(swings)):
-            if used[j]:
-                continue
-            if abs(swings[j]["price"] - s["price"]) / s["price"] * 100 <= price_tolerance_pct:
-                cluster.append(j)
+        levels.append({
+            "price": sum(cl["prices"]) / len(cl["prices"]),
+            "touches": len(cl["prices"]),
+            "type": lvl_type,
+        })
 
-        if len(cluster) >= min_touches:
-            for idx in cluster:
-                used[idx] = True
-            cluster_prices = [swings[idx]["price"] for idx in cluster]
-            cluster_types = set(swings[idx]["type"] for idx in cluster)
-            level_type = "BOTH" if len(cluster_types) > 1 else (
-                "RESISTANCE" if "HIGH" in cluster_types else "SUPPORT"
-            )
-            levels.append({
-                "price": float(np.mean(cluster_prices)),
-                "touches": len(cluster),
-                "type": level_type,
-                "indices": [swings[idx]["index"] for idx in cluster],
-            })
-
-    levels.sort(key=lambda x: x["touches"], reverse=True)
+    levels.sort(key=lambda l: l["touches"], reverse=True)
     return levels
 
 

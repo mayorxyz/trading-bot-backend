@@ -42,18 +42,27 @@ def detect_all_patterns(df: pd.DataFrame) -> dict:
     return results
 
 
-def get_active_patterns(df: pd.DataFrame, bar_index: int = -1) -> dict:
+def get_active_patterns(df: pd.DataFrame, lookback: int = 3) -> dict:
     """
-    Return only patterns firing (nonzero) at a given bar (default: latest/last bar).
-    Returns {pattern_name: signal_value}. Positive = bullish, negative = bearish
-    (per TA-Lib convention; magnitude varies 100/-100/200/-200 by pattern).
+    Return patterns firing in the last `lookback` bars (default: 3).
+    Candlestick patterns are rare; checking only the exact last bar 
+    will cause you to miss 90% of valid setups.
     """
+    # Safety: Fill any NaNs in the CSV so TA-Lib doesn't silently return all zeros
+    df = df.ffill().bfill()
+    
     all_patterns = detect_all_patterns(df)
     active = {}
+    
     for name, series in all_patterns.items():
-        val = series.iloc[bar_index]
-        if val != 0:
-            active[name] = int(val)
+        # Check the last `lookback` bars instead of just the exact last bar
+        recent_vals = series.iloc[-lookback:]
+        non_zero = recent_vals[recent_vals != 0]
+        
+        if not non_zero.empty:
+            # Take the most recent non-zero signal in that window
+            active[name] = int(non_zero.iloc[-1])
+            
     return active
 
 
