@@ -13,6 +13,21 @@ def validate_trade(trade, current_price, min_rr=2.0, max_entry_distance_pct=2.0,
     sl = trade["sl"]["sl_price"]
     tp = trade["tp"]["tp_price"]
     rr = trade["tp"]["rr"]
+    direction = trade["direction"]
+
+    # Directional sanity: SL and TP must be on the correct side of entry.
+    # Checked explicitly because every distance below uses abs(), which cannot
+    # distinguish a valid stop from an inverted one.
+    if direction == "LONG":
+        if sl >= entry:
+            reasons.append(f"inverted SL: {sl} not below LONG entry {entry}")
+        if tp <= entry:
+            reasons.append(f"inverted TP: {tp} not above LONG entry {entry}")
+    else:
+        if sl <= entry:
+            reasons.append(f"inverted SL: {sl} not above SHORT entry {entry}")
+        if tp >= entry:
+            reasons.append(f"inverted TP: {tp} not below SHORT entry {entry}")
 
     entry_dist_pct = abs(current_price - entry) / current_price * 100
     sl_dist_pct = abs(entry - sl) / entry * 100

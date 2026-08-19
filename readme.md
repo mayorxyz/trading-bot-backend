@@ -1,457 +1,131 @@
-```markdown
-# Trading Bot Backend — Structural Trading System
+# Trading Bot Backend
 
-**Status**: Alpha (Phases 1–4 complete, Phase 5 partial, Phase 6 stubs, no live execution)  
-**Language**: Python 3.8+  
-**Dependencies**: pandas, numpy, talib, asyncio, websockets, sqlite3
+Python backend for structural market analysis, live Bybit candle processing, historical backtests, and a read-only FastAPI surface. The repository currently has three deliberately separate data paths:
 
----
+- **LIVE**: `live_runner.py` computes rolling live snapshots and writes `live_state.db`; `api.py` reads those snapshots.
+- **ANALYSIS/backtest**: `backtest.py` replays local historical CSVs and writes analysis jobs/results to `analysis_runs.db` through `api.py`.
+- **PREDICT**: `api.py` fetches live candles into memory, runs the pipeline once, and writes nothing.
 
-## 1. Project Purpose
+All three use the same core `pipeline.py` logic where applicable, but they do not share data with one another. The live database is not an analysis archive, analysis jobs do not feed live state, and `/predict` has no storage side effect.
 
-A full-stack crypto/forex trading system implementing **structural trading concepts** from high-quality trading education:
+## How It Fits Together
 
-- Entry via imbalance/FVG confluence with double rejection validation
-- Risk-managed position sizing (1% base, adaptive via drawdown/profit overlays)
-- Top-down multi-timeframe bias alignment before entry
-- Automated trade journaling + outcome tracking for pattern optimization
-- Backtest harness with future-candle fill simulation (not just latest price)
+### LIVE path
 
-**Goal**: Reduce discretionary trading noise by codifying price action rules into repeatable, testable patterns.
-
----
-
-## 2. Architecture Overview
-
-### Six-Phase Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    RAW OHLCV DATA (Bybit/Exchange)              │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-        ┌────────────────────▼─────────────────────┐
-        │  Phase 1: Primitives & Trend Filter      │
-        │  • Candle body/wick analysis (Doji)      │
-        │  • 3-bar / 5-bar fractal swings          │
-        │  • 50-EMA slope + bias classification    │
-        │  • Trend-change flags                    │
-        └────────────────────┬─────────────────────┘
-                             │
-        ┌────────────────────▼──────────────────────────┐
-        │  Phase 2: Signal Engine                       │
-        │  • Imbalance/FVG detection (3-candle)         │
-        │  • Double Rejection (hold/fail/untested)      │
-        │  • Sweep vs Break of liquidity levels         │
-        └────────────────────┬──────────────────────────┘
-                             │
-        ┌────────────────────▼────────────────────────────┐
-        │  Phase 3: Regime Filters & Entry Model          │
-        │  • Chop/Consolidation/Trending regime check     │
-        │  • Top-down bias (HTF wins conflicts)           │
-        │  • VSSR entry (POI tap → lower-TF imbalance)   │
-        └────────────────────┬────────────────────────────┘
-                             │
-        ┌────────────────────▼──────────────────────────┐
-        │  Phase 4: Risk Management & Journal           │
-        │  • 1% per-trade, daily/weekly loss caps       │
-        │  • Flatline (drawdown) & profit-scale rules   │
-        │  • 2-bullets-per-POI limit                    │
-        │  • Trade journal + pattern win-rate tracking  │
-        └────────────────────┬──────────────────────────┘
-                             │
-        ┌────────────────────▼──────────────────────────────┐
-        │  Phase 5: Market Structure & Liquidity            │
-        │  • HH/HL/LL/LH trend confirmation                │
-        │  • BOS (Break of Structure) detection             │
-        │  • TC (Trend Change) + fake-TC filter             │
-        │  • Liquidity classification (low-fruit/major)     │
-        │  • MSS (Market Structure Shift) early warning     │
-        └────────────────────┬──────────────────────────────┘
-                             │
-        ┌────────────────────▼──────────────────────────────┐
-        │  Phase 6: Supplementary Filters (PARTIAL)         │
-        │  • Break-even management                          │
-        │  • Leverage/margin/liquidation calcs (crypto)     │
-        │  • News filter (NFP/FOMC/CPI blackout)            │
-        │  • Session killzones (forex/crypto empirical)     │
-        │  • Compounding projection simulation              │
-        └────────────────────┬──────────────────────────────┘
-                             │
-        ┌────────────────────▼──────────────────────────────┐
-        │  ⚙️  SL/TP Calculator                             │
-        │  • SL = WIDER(ATR-based, swing-based)             │
-        │  • TP = next S/R level or fixed R:R fallback      │
-        │  • Entry = strongest S/R touch in range           │
-        └────────────────────┬──────────────────────────────┘
-                             │
-        ┌────────────────────▼────────────────┐
-        │  ✅ VALID SIGNAL                    │
-        │  • Confluence score (0-100)         │
-        │  • Log to SQLite signal_store.db    │
-        └────────────────────┬────────────────┘
-                             │
-        ┌────────────────────▼────────────────────────────┐
-        │  🧪 BACKTEST HARNESS                            │
-        │  • Walk forward through future candles           │
-        │  • Check SL/TP hit per candle (not just price)   │
-        │  • Aggregate: win rate, RR, profit factor        │
-        └────────────────────┬────────────────────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │  📊 OUTCOMES    │
-                    │  (WIN/LOSS/     │
-                    │   TIMEOUT)      │
-                    └─────────────────┘
+```text
+live_runner.py -> pipeline.py -> live_state.db -> api.py (/live/*)
 ```
 
----
+`live_runner.py` seeds and streams Bybit candles, computes live overlays/signals, and persists a rolling hand-off buffer through `live_store.py`. `api.py` exposes that buffer through `/live/state`, `/live/zones`, `/live/levels`, and `/live/stats`. Live processing does not read historical CSVs.
 
-## 3. Data Flow: Entry to Exit
+### ANALYSIS/backtest path
 
-```
- 1. RAW OHLCV (from Bybit REST or WebSocket)
-         ↓
- 2. Phase 1: Build fractal swings + EMA bias
-         ↓
- 3. Phase 2: Detect imbalances, test for Double Rejection
-         ↓
- 4. Phase 3a: Filter regime (chop = SKIP)
-         ↓
- 5. Phase 3b: Resolve top-down bias (wait for ≥2 TF alignment)
-         ↓
- 6. Phase 3c: Look for VSSR entry (POI tap + lower-TF imbalance)
-         ↓
- 7. Phase 4: Check risk limits (daily/weekly cap, drawdown overlay)
-         ↓
- 8. Entry + SL/TP from support_resistance + zigzag
-         ↓
- 9. Validity check (R:R ≥ 2.0, entry ≤ 2% away)
-         ↓
-10. Confluence score (0-100, weighted 8 factors)
-         ↓
-11. Log to SQLite (signal_store.db)
-         ↓
-12. [BACKTEST ONLY] Simulate: check SL/TP hit vs future candles
-         ↓
-13. Aggregate stats: win rate, avg RR, profit factor
+```text
+backtest.py or POST /analyze -> pipeline.py -> historical data/*.csv
+                                                   -> analysis_runs.db
 ```
 
-> **MISSING LINK**: Live execution does not exist. Step 11 is the terminal point.  
-> To go live, add:
-> - Order placement (Bybit REST `POST /v5/order/create`)
-> - Position tracking (memory + SQLite cache)
-> - Exit handler (check pending signals vs market prices each candle)
+`POST /analyze` queues a date-bounded backtest. `backtest.py` loads local `1D`, `4H`, and `1H` CSV history, calls the pipeline while replaying bars, and stores job/trade results through `analysis_store.py`. A backtest may also use the lower-level `backtest.py` API directly. This path does not read `live_state.db`.
 
----
+### PREDICT path
 
-## 4. File-by-File Description
-
-| File | Responsibility | Key Exports | Dependencies |
-|------|---|---|---|
-| **phase1_primitives.py** | Candle analysis, fractal swings, EMA trend | `candle_primitives()`, `fractal_swings()`, `ema_trend_filter()`, `build_phase1_features()` | pandas, numpy |
-| **phase2_signal_engine.py** | Imbalance detection, Double Rejection, Sweep/Break | `detect_imbalances()`, `evaluate_double_rejection()`, `evaluate_sweep_or_break()`, `mark_tested_imbalances()` | phase1_primitives, pandas |
-| **phase3_orchestration.py** | Regime classification, top-down bias, VSSR entry | `detect_regime()`, `per_tf_bias()`, `resolve_topdown_bias()`, `find_vssr_entry()` | phase2_signal_engine, pandas |
-| **phase4_risk_journal.py** | RiskManager class, position sizing, trade logging | `RiskManager`, `TradeJournal`, `summary_stats()` | pandas, datetime |
-| **phase5_structure_liquidity.py** | Market structure classification, BOS/TC | `classify_structure()`, `check_fake_tc()`, `detect_mss()` | phase1_primitives, pandas |
-| **phase6_supplementary.py** | Break-even, leverage/liquidation, news/session filters | `check_breakeven_trigger()`, `compute_liquidation_price()`, `is_news_blackout()`, `is_favorable_session()` | pandas |
-| **zigzag.py** | ATR-based swing detection (foundation) | `get_zigzag_swings()`, `print_swings()` | talib, numpy |
-| **support_resistance.py** | Cluster swings into S/R levels | `find_sr_levels()`, `nearest_level()` | numpy |
-| **consolidation.py** | Consolidation zone detection | `find_consolidation_zones()` | numpy |
-| **breakouts.py** | S/R breakout + consolidation breakout detection | `detect_sr_breakout()`, `detect_consolidation_breakout()` | (none) |
-| **wicks.py** | Rejection wick detection + S/R confluence | `detect_wicks()`, `wick_at_level()` | numpy |
-| **volume.py** | Volume spike + divergence detection | `detect_volume_spike()`, `detect_volume_divergence()` | numpy |
-| **entry.py** | Best entry price finder | `find_best_entry()` | (none) |
-| **sl_tp.py** | SL/TP calculator (ATR + swing + S/R level) | `calculate_sl()`, `calculate_tp()`, `get_trade_levels()` | (none) |
-| **validity.py** | Trade validation (R:R, distance checks) | `validate_trade()` | (none) |
-| **confluence.py** | Signal confluence scoring (0-100) | `calculate_confluence()`, `confidence_label()` | (none) |
-| **pattern_detector.py** | All 61 TA-Lib candlestick patterns | `detect_all_patterns()`, `get_active_patterns()`, `summarize_bias()` | talib, pandas |
-| **pipeline.py** | Full analysis pipeline (1 pair snapshot) | `analyze_pair()` | all above |
-| **signal_store.py** | SQLite logging of signals + outcomes | `init_db()`, `log_signal()`, `close_signal()`, `get_pending_signals()` | sqlite3 |
-| **pattern_stats.py** | Win-rate queries per pattern/pair/TF | `get_stats()`, `get_pattern_winrate()` | sqlite3 |
-| **backtest.py** | Historical simulation harness | `simulate_trade()`, `run_backtest()`, `summarize_backtest()` | numpy |
-| **ingestion.py** | Bybit WebSocket candle stream (live) | `listen()` (async) | websockets, asyncio |
-| **ingestion_analysis.py** | Bybit WebSocket + TA-Lib pattern detection | `analyze()`, `prefill_history()`, `listen()` (async) | talib, websockets |
-| **multi_pair_scanner.py** | (stub/partial) Multi-pair scanning logic | — | — |
-| **multi_timeframe_analysis.py** | Multi-TF confluence analysis (4 patterns + custom) | `detect_tweezer()`, `detect_inside_bar_false_breakout()`, `fibonacci_levels()`, `fetch_candles()` | talib, numpy, requests |
-| **test_connection.py** | Quick API health check | — | requests |
-
----
-
-## 5. Implementation Status
-
-### ✅ Fully Implemented
-
-- [x] **Candle primitives** — body, wick, Doji detection (`phase1_primitives.py`)
-- [x] **Fractals (3-bar, 5-bar)** — confirmed swing points (`phase1_primitives.py`)
-- [x] **EMA50 bias** — slope trend filter, above/below, trend change (`phase1_primitives.py`)
-- [x] **Imbalance/FVG detection** — 3-candle gap, tested/untested tracking (`phase2_signal_engine.py`)
-- [x] **Double Rejection Rule** — hold/fail/unresolved classification (`phase2_signal_engine.py`)
-- [x] **Sweep vs Break** — multi-candle acceptance window check (`phase2_signal_engine.py`)
-- [x] **Liquidity classification** — high-prob retest levels via clustering (`support_resistance.py`)
-- [x] **S/R Level detection** — zigzag swing clustering (`support_resistance.py` + `zigzag.py`)
-- [x] **Regime classification** — chop/consolidation/trending (`phase3_orchestration.py`)
-- [x] **Consolidation zones** — tight-range detection (`consolidation.py`)
-- [x] **Top-down bias** — HTF wins conflicts, ≥2 TF alignment (`phase3_orchestration.py`)
-- [x] **VSSR entry model** — POI tap → lower-TF imbalance confirmation (`phase3_orchestration.py`)
-- [x] **SL/TP calculators** — ATR + swing combo, S/R fallback (`sl_tp.py`)
-- [x] **Trade validity filters** — R:R, distance, SL width (`validity.py`)
-- [x] **Risk manager** — 1% per-trade, daily/weekly caps, flatline, profit scaling (`phase4_risk_journal.py`)
-- [x] **Trade journal** — SQL logging, pattern/pair/TF tracking (`phase4_risk_journal.py` + `signal_store.py`)
-- [x] **Candlestick patterns** — all 61 TA-Lib functions (`pattern_detector.py`)
-- [x] **Backtest harness** — proper future-candle fill simulation (`backtest.py`)
-- [x] **Confluence scoring** — 8-factor weighted score (`confluence.py`)
-- [x] **Volume signals** — spike + divergence detection (`volume.py`)
-- [x] **Wick rejection** — stop-hunt detection at S/R levels (`wicks.py`)
-- [x] **Breakout detection** — S/R + consolidation (`breakouts.py`)
-- [x] **Entry finder** — strongest level within range (`entry.py`)
-
-### 🟡 Partially Implemented
-
-- [ ] **BOS/TC detection** — structure events logged, but **Phase 3 does not consume** them for trade decisions (`phase5_structure_liquidity.py`)
-- [ ] **Fake-TC filter** — coded but **not wired into entry logic** (`phase5_structure_liquidity.py`)
-- [ ] **Market Structure Shift (MSS)** — detection function exists but **never called** (`phase6_supplementary.py`)
-- [ ] **News filter** — calendar-aware blackout logic exists but **not in pipeline** (`phase6_supplementary.py`)
-- [ ] **Session killzones** — defined but **empirical for crypto, no enforcement** (`phase6_supplementary.py`)
-- [ ] **Multi-timeframe analysis** — scripts exist (`multi_pair_scanner.py`, `multi_timeframe_analysis.py`) but **not integrated** with decision pipeline
-- [ ] **Custom patterns** — Tweezer Top/Bottom, Inside Bar False Breakout coded but **not in active pattern detection** (`multi_timeframe_analysis.py`)
-
-### ❌ Missing / Not Implemented
-
-- [ ] **Live execution connector** — no Bybit/Binance order placement
-- [ ] **Position tracker** — no state management for open positions
-- [ ] **Order management** — no modify/close/exit logic
-- [ ] **Data persistence** — no candle history database (only signal store)
-- [ ] **Account integration** — no balance/margin queries
-- [ ] **Break-even management** — logic exists but not hooked to position updates
-- [ ] **Leverage/liquidation alerts** — calculations exist, no monitoring
-- [ ] **Compounding simulation** — projection logic exists but no real P&L feedback loop
-- [ ] **Custom ML patterns** — no model integration
-- [ ] **Strategy optimizer** — no backtester-to-parameter searcher pipeline
-- [ ] **Live multi-pair scanner** — no automated pair watchlist + concurrent analysis
-
----
-
-## 6. Configuration Parameters
-
-### `phase1_primitives.py`
-```python
-ema_length = 50            # EMA for trend filter
-side_bars = 2              # 5-bar fractals (side_bars=1 → 3-bar)
-slope_lookback = 3         # candles to check EMA slope
+```text
+POST /predict -> live in-memory candle buffer -> pipeline.py
 ```
 
-### `phase2_signal_engine.py`
-```python
-min_body_ratio = 0.6       # expansion candle threshold for FVG
-max_candles = 3            # Double Rejection window
-acceptance_bars = 3        # Sweep/Break confirmation bars
+`/predict` fetches enough Bybit candles for the bias and execution timeframes, runs `analyze_pair_with_bias()` synchronously, passes `db_path=None`, and returns a signal or skip reason. It is stateless: it does not read or write `live_state.db`, `analysis_runs.db`, `signals.db`, or CSV files.
+
+## Python File Inventory
+
+Each row identifies the file's role, direct callers/importers, direct callees/dependencies, and verified storage effects. “None” means the file itself does not touch that storage type; a caller may still do so.
+
+| File | Role | Called by | Calls / depends on | Storage touched |
+|---|---|---|---|---|
+| `analysis_store.py` | Persists queued analysis jobs, status, summaries, and completed trades. | `api.py` | `sqlite3`, `pandas`, JSON serialization. | Reads/writes `analysis_runs.db`; no `live_state.db` or CSV. |
+| `api.py` | FastAPI HTTP surface for health, symbols, live state, charts, backtests, and prediction. | Uvicorn/HTTP clients. | `analysis_store.py`, `backtest.py`, `live_runner.py`, `live_store.py`, `market_data.py`, `phase4_risk_journal.py`, `pipeline.py`; pandas. | Reads local `data/*.csv`; reads/writes `analysis_runs.db` indirectly; reads `live_state.db` indirectly; `/predict` persists nothing. |
+| `backtest.py` | Loads historical candles, replays bars, simulates SL/TP outcomes, and summarizes results. | `api.py`, `profile_pipeline.py`; `live_runner.py` imports constants. | `pipeline.py`, `phase4_risk_journal.py`, pandas, NumPy. | Reads `data/{symbol}_{1d,4h,1h}.csv`; pipeline logging uses `backtest_signals.db`; no `live_state.db` or `analysis_runs.db` directly. |
+| `bias_bridge.py` | Adapts Phase 1-3 calculations into the pipeline's tradable direction/bias result. | `pipeline.py`. | `phase1_primitives.py`, `phase2_signal_engine.py`, `phase3_orchestration.py`. | None. |
+| `breakouts.py` | Detects support/resistance and consolidation breakouts. | `pipeline.py`. | Input S/R levels and consolidation zones; no imported project module. | None. |
+| `confluence.py` | Calculates the weighted signal score and confidence label. | `pipeline.py`. | Input pattern, trend, MTF, S/R, wick, and volume facts; no imported project module. | None. |
+| `consolidation.py` | Finds tight consolidation zones from swing points. | `pipeline.py`, `live_runner.py`. | NumPy; swing data from callers. | None. |
+| `entry.py` | Selects the strongest directional S/R entry level. | `pipeline.py`; `test.py`. | Input S/R levels; no imported project module. | None. |
+| `ingestion.py` | Minimal standalone Bybit WebSocket candle listener/printer. | CLI only; no repository importer. | `asyncio`, `websockets`, JSON. | None. |
+| `ingestion_analysis.py` | Standalone rolling WebSocket analysis with TA-Lib patterns, RSI, and ATR. | CLI only; no repository importer. | Bybit REST prefill, `websockets`, TA-Lib, NumPy. | None. |
+| `ingestion_bybit.py` | Bybit REST kline/instrument fetcher and optional CSV exporter. | `live_runner.py`, `market_data.py`; CLI. | `requests`, pandas, filesystem. | `fetch_and_save_all()` writes CSVs; other functions do not touch `live_state.db` or `analysis_runs.db`. |
+| `live_runner.py` | Seeds Bybit data, consumes the live WebSocket, runs live analysis, and writes snapshots/trades. | CLI process; `api.py` imports constants/helpers. | `ingestion_bybit.py`, `pipeline.py`, `live_store.py`, `backtest.py` constants, Phases 1-3, `consolidation.py`, `support_resistance.py`, `zigzag.py`, `websockets`. | Writes `live_state.db` through `live_store.py`; no CSV reads in the live seed/stream path and no `analysis_runs.db`. |
+| `live_store.py` | Owns the rolling SQLite hand-off store for live snapshots, overlays, skips, and trades. | `live_runner.py`, `api.py`, `test_live_persistence.py`. | `sqlite3`, pandas, JSON, datetime. | Reads/writes `live_state.db`; purges old snapshots while retaining live trades; no analysis CSV path. |
+| `market_data.py` | Caches Bybit candles, instrument symbols, and timeframe metadata for API charts. | `api.py`. | `ingestion_bybit.py`, pandas, threading/time. | In-memory caches only; no DB or CSV. |
+| `multi_pair_scanner.py` | Standalone multi-pair pattern, Fibonacci, and trend scanner. | CLI only; optional import attempt from `multi_timeframe_analysis.py`. | `requests`, TA-Lib, NumPy. | None. |
+| `multi_timeframe_analysis.py` | Standalone multi-timeframe pattern, trend, RSI, and Fibonacci analysis. | CLI only; optional import attempt from `multi_pair_scanner.py`. | `requests`, TA-Lib, NumPy. | None. |
+| `pattern_detector.py` | Runs TA-Lib candlestick recognizers and summarizes active bullish/bearish patterns. | `pipeline.py`. | TA-Lib, pandas, NumPy. | None. |
+| `pattern_stats.py` | Queries completed signal win rates by pattern, pair, and timeframe. | No production importer found; CLI/library use. | `signal_store.py` database path, `sqlite3`. | Reads `signals.db` by default; no `live_state.db`, `analysis_runs.db`, or CSV. |
+| `phase1_primitives.py` | Computes candle primitives, fractal swings, and EMA trend/bias features. | `phase2_signal_engine.py`, `bias_bridge.py`, `phase5_structure_liquidity.py`, `live_runner.py`. | pandas, NumPy. | None. |
+| `phase2_signal_engine.py` | Detects FVG/imbalances, double rejection, tested zones, and sweep/break behavior. | `phase3_orchestration.py`, `bias_bridge.py`, `live_runner.py`, `phase5_structure_liquidity.py`. | `phase1_primitives.py`, pandas, NumPy. | None. |
+| `phase3_orchestration.py` | Classifies regime, resolves top-down bias, and supports VSSR/opposing-imbalance logic. | `bias_bridge.py`, `live_runner.py`; internal demo. | `phase2_signal_engine.py` and Phase 1 EMA logic. | None. |
+| `phase4_risk_journal.py` | Provides in-memory risk management, position sizing, trade journaling, and statistics. | `backtest.py`, `api.py`; standalone demo. | pandas, dataclasses, datetime. | No direct DB/CSV access; its journal is in memory. |
+| `phase5_structure_liquidity.py` | Detects market structure, BOS/TC, MSS-related structure, liquidity, and market phase. | No production importer; standalone demo. | `phase1_primitives.py`, `phase2_signal_engine.py`. | None. |
+| `phase6_supplementary.py` | Provides break-even, leverage/liquidation, cost, MSS, news/session, and compounding helpers. | No production importer; standalone demo. | pandas, NumPy, datetime; caller-provided event data. | None. |
+| `pipeline.py` | Shared core pipeline: bias, swings, S/R, zones, breakouts, wicks, volume, entry, SL/TP, validation, confluence, and optional signal logging. | `api.py`, `backtest.py`, `live_runner.py`, `profile_pipeline.py`. | `zigzag.py`, `support_resistance.py`, `consolidation.py`, `breakouts.py`, `wicks.py`, `entry.py`, `sl_tp.py`, `validity.py`, `confluence.py`, `volume.py`, `signal_store.py`, `bias_bridge.py`, `pattern_detector.py`. | Writes the caller-selected signal DB, default `signals.db`; `db_path=None` writes nothing; no CSV. |
+| `profile_pipeline.py` | Profiles representative backtest/pipeline execution points. | CLI only. | `backtest.py`, `pipeline.py`, `cProfile`, `pstats`. | Reads historical CSVs through `backtest.py`; pipeline logging uses `backtest_signals.db`. |
+| `signal_store.py` | Creates and updates the SQLite signal ledger, including pending and closed outcomes. | `pipeline.py`; `pattern_stats.py` imports its default path. | `sqlite3`, datetime. | Reads/writes configurable DB, default `signals.db`; not `live_state.db` or `analysis_runs.db`. |
+| `sl_tp.py` | Calculates stop-loss and take-profit levels from ATR, swings, S/R, and fallback R:R. | `pipeline.py`. | Caller-provided ATR, swings, and S/R; no imported project module. | None. |
+| `support_resistance.py` | Clusters swing points into S/R levels and finds nearest levels. | `pipeline.py`, `live_runner.py`; `test.py`. | NumPy; caller-provided swing data. | None. |
+| `test.py` | Ad hoc synthetic check for zigzag, S/R, and entry helpers. | CLI only. | `zigzag.py`, `support_resistance.py`, `entry.py`. | None. |
+| `test_api.py` | Black-box HTTP checks for API routes, Bybit chart behavior, validation, and storage separation. | CLI only; requires Uvicorn. | `urllib`, SQLite, running API. | Reads test live state and documents test analysis DB paths; does not create application rows itself. |
+| `test_connection.py` | One-shot Bybit server-time connectivity probe. | CLI only. | `requests`. | None. |
+| `test_live_persistence.py` | Replays historical candles through live persistence and checks retention/data integrity. | CLI only. | `live_runner.py`, `live_store.py`, backtest CSV loaders, pandas, SQLite. | Reads `data/*.csv`; writes scratch `live_state_test.db`; no production analysis DB. |
+| `validity.py` | Checks trade direction, stop/target validity, R:R, and distance constraints. | `pipeline.py`. | Input trade and current price; no imported project module. | None. |
+| `volume.py` | Detects volume spikes and price-volume divergence. | `pipeline.py`. | NumPy. | None. |
+| `wicks.py` | Detects rejection wicks and matches recent wick events to S/R levels. | `pipeline.py`. | NumPy; caller-provided S/R. | None. |
+| `zigzag.py` | Finds ATR-based swing highs and lows used by structure and S/R logic. | `pipeline.py`, `live_runner.py`; `test.py`. | TA-Lib ATR, NumPy. | None. |
+
+## API Endpoints
+
+- `GET /health` - Returns API status, configured DB paths, live retention information, and market-data cache diagnostics.
+- `GET /symbols` - Lists Bybit/local symbols, chart timeframes, local timeframes, and whether local analysis history is available.
+- `GET /live/state` - Returns the latest live tick, timeframe state, bias, signal/skip information, recent skips, and overlay freshness.
+- `GET /live/zones` - Returns current FVG/imbalance and consolidation zones, optionally filtered by timeframe.
+- `GET /live/levels` - Returns current support/resistance levels, optionally filtered by timeframe and ordered by touches.
+- `GET /live/stats` - Returns resolved live-trade win rate, average R:R, profit factor, in-flight count, and recent resolved trades.
+- `GET /ohlc` - Returns recent candles oldest-first; source can prefer Bybit, force local CSV, or force Bybit.
+- `POST /analyze` - Validates local `1D`/`4H`/`1H` history, queues a date-bounded backtest, stores the job in `analysis_runs.db`, and returns a job ID.
+- `GET /analyze/status/{job_id}` - Returns queued/running/completed/error state, summary, funnel counts, and completed trades when available.
+- `GET /analyze/jobs` - Lists recent analysis jobs newest first.
+- `POST /predict` - Fetches live candles into memory, runs the shared pipeline synchronously, and returns a signal or skip without persistence.
+
+## How To Run Locally
+
+Use three terminals from the backend directory. Adjust paths if the frontend lives in another repository; this repository contains the backend Python files only.
+
+**Terminal 1: API**
+
+```powershell
+cd C:\Users\OFFICIAL\Desktop\trading-bot-backend
+python -m uvicorn api:app --reload --port 8000
 ```
 
-### `phase3_orchestration.py`
-```python
-VSSR_MAP = {'1D': '1H', '4H': '15M', '1H': '5M', '15M': '3M'}  # POI → entry TF
+**Terminal 2: live runner**
+
+```powershell
+cd C:\Users\OFFICIAL\Desktop\trading-bot-backend
+python live_runner.py
 ```
 
-### `phase4_risk_journal.py`
-```python
-base_risk_pct = 0.01       # 1% per trade
-max_daily_loss_pct = 0.02  # 2% daily cap
-max_weekly_loss_pct = 0.06 # 6% weekly cap
-drawdown_threshold = 0.04  # -4% → halve risk (flatline)
-profit_threshold = 0.10    # +10% → +0.25% risk (scale)
+**Terminal 3: frontend**
+
+```powershell
+cd path\to\frontend
+npm run dev
 ```
 
-### `sl_tp.py`
-```python
-atr_mult = 1.5             # ATR multiplier for SL
-min_rr = 2.0               # Minimum reward:risk ratio
-```
+For a backend-only setup, run the first two terminals and call the API directly at `http://127.0.0.1:8000`. The live runner requires the configured Bybit network access and dependencies in the local Python environment.
 
-### `pipeline.py` — Confluence Weights
-```python
-weights = {
-    'pattern_match':    20,   # Candlestick pattern detected
-    'trend_align':      20,   # SMA/EMA agrees
-    'mtf_alignment':    20,   # Multi-TF full alignment
-    'sr_level_strength': 15,  # Entry level touches (scaled)
-    'wick_rejection':   10,   # Rejection wick at entry
-    'fib_confluence':   10,   # Fib 50/61.8
-    'volume_confirm':    5,   # Volume spike on signal
-}
-```
+## Storage Boundaries
 
----
+- `live_state.db` is the rolling live hand-off owned by `live_store.py`.
+- `analysis_runs.db` stores queued `/analyze` jobs and backtest results owned by `analysis_store.py`.
+- `signals.db` is the default pipeline signal ledger owned by `signal_store.py`.
+- `backtest_signals.db` is used when `backtest.py` passes that path to the pipeline.
+- `data/*.csv` is historical/local candle input for backtests and local chart fallback. `ingestion_bybit.fetch_and_save_all()` can write CSV history.
 
-## 7. How to Run: Backtest
-
-```python
-from backtest import run_backtest, summarize_backtest
-from pipeline import analyze_pair
-import numpy as np
-
-# Replace with real historical data
-n = 500
-price = 100
-opens   = [price + np.random.randn() * 0.5 for _ in range(n)]
-highs   = [o + abs(np.random.randn()) for o in opens]
-lows    = [o - abs(np.random.randn()) for o in opens]
-closes  = [opens[i] + np.random.randn() * 0.8 for i in range(n)]
-volumes = [np.random.uniform(1000, 5000) for _ in range(n)]
-
-candles = {
-    'open': opens,
-    'high': highs,
-    'low': lows,
-    'close': closes,
-    'volume': volumes
-}
-
-def signal_gen(candles_slice, idx):
-    result = analyze_pair(
-        pair='BTCUSDT', timeframe='1H',
-        opens=candles_slice['open'],
-        highs=candles_slice['high'],
-        lows=candles_slice['low'],
-        closes=candles_slice['close'],
-        volumes=candles_slice['volume'],
-        direction='LONG',
-        pattern_name=None,
-        trend_aligned=True,
-        mtf_full_alignment=False
-    )
-    if 'skipped' in result:
-        return None
-    return {
-        'direction': result['direction'],
-        'entry_price': result['entry'],
-        'sl_price': result['sl'],
-        'tp_price': result['tp'],
-        'pattern': 'pipeline_signal'
-    }
-
-results = run_backtest(candles, signal_gen, max_bars=200)
-summary = summarize_backtest(results)
-print('Backtest Summary:', summary)
-```
-
----
-
-## 8. Next Steps Roadmap
-
-### Priority 1: Live Execution (High Impact)
-- [ ] Create `live_executor.py` — connects to Bybit Order REST API
-- [ ] Implement `PlaceOrderRunner` — entry at calculated price with SL/TP legs
-- [ ] Add `PositionTracker` class — memory + SQLite state for open trades
-- [ ] Wire `signal_store` → executor → position updates
-
-### Priority 2: Multi-Pair Scanner (Medium Impact)
-- [ ] `multi_pair_live_loop.py` — iterate pairs, analyze each per TF
-- [ ] Concurrent WebSocket per pair (or single multiplexed connection)
-- [ ] Round-robin analysis with configurable scan interval
-
-### Priority 3: Phase 5 Integration (Medium Impact)
-- [ ] Consume `classify_structure()` output in Phase 3 entry logic
-- [ ] Wire BOS events as **entry confirmation trigger**
-- [ ] Use TC + fake-TC filter to **exit early on reversal signal**
-
-### Priority 4: Phase 6 Enforcement (Low Impact)
-- [ ] Add news filter to `can_trade()` check in RiskManager
-- [ ] Session-aware entry (forex) + empirical windows (crypto)
-- [ ] Break-even update hook in position tracker
-
-### Priority 5: Optimization & Backtesting (Medium Impact)
-- [ ] Parameter grid search (SMA length, ATR mult, confluence threshold)
-- [ ] Monte Carlo walk-forward validation
-- [ ] Per-pattern + per-pair win-rate filtering
-
----
-
-## 9. Testing & Validation
-
-### Unit Tests (Not Yet Implemented)
-```
-tests/
-  test_phase1_primitives.py
-  test_phase2_signals.py
-  test_phase3_orchestration.py
-  test_phase4_risk.py
-  test_sl_tp_calculator.py
-  test_backtest_engine.py
-```
-
-### Manual Validation
-1. Run backtest on known market (e.g., 2024 BTC range) → expect >50% win rate
-2. Check signal store for pattern win-rates → filter low-confidence (<2 occurrences)
-3. Paper trade on live feeds before deploying real orders
-
----
-
-## 10. Dependencies
-
-```
-pandas>=1.3.0
-numpy>=1.21.0
-ta-lib>=0.4.24
-websockets>=10.0
-requests>=2.28.0
-```
-
-### Database
-```
-signals.db (SQLite)
-  ├── signals (table)
-  │   ├── id (PRIMARY KEY)
-  │   ├── timestamp, pair, timeframe
-  │   ├── direction, pattern, shape
-  │   ├── entry/sl/tp prices, R:R
-  │   ├── confluence_score, valid
-  │   ├── outcome (WIN/LOSS/PENDING)
-  │   └── closed_price, closed_at
-  └── [FUTURE] positions (open trade state)
-```
-
-### API Keys (Not Yet Wired)
-```env
-BYBIT_API_KEY=...
-BYBIT_API_SECRET=...
-```
-
----
-
-## 11. Limitations & Caveats
-
-1. **Backtest assumes perfect fills** — uses candle high/low, not spread/slippage
-2. **Signal store queries are simple** — no correlation between patterns, no ML ranking
-3. **Multi-TF alignment is hard-coded** — no adaptive timeframe selection per pair
-4. **No position management** — SL/TP are static after entry (no trailing stop, no partial TP)
-5. **News filter is schema-only** — needs live calendar data integration
-6. **Phase 5 outputs unused** — BOS/TC events calculated but not fed back to Phase 3
-7. **Backtest is single-threaded** — slow for large parameter grids
-
----
-
-## 12. Glossary
-
-| Term | Meaning |
-|------|---------|
-| **FVG** | Fair Value Gap — imbalance zone where price is likely to return |
-| **DR** | Double Rejection — price taps zone then holds (proven support/resistance) |
-| **BOS** | Break of Structure — price body-closes beyond last confirmed extreme |
-| **TC** | Trend Change — close breaks last confirmed swing point in opposite direction |
-| **fake-TC** | TC that fails to extend via BOS within N bars, then reverts |
-| **MSS** | Market Structure Shift — swing point fails to extend trend (early warning) |
-| **VSSR** | Valid Setup, Smart Reentry — POI tap → lower-TF imbalance entry |
-| **POI** | Point of Interest — higher-TF imbalance zone |
-| **HTF** | Higher Timeframe (wins conflicts in multi-TF bias resolution) |
-| **R:R** | Risk:Reward ratio (distance to TP / distance to SL) |
-| **Confluence** | Multiple independent signals agreeing → higher confidence |
-| **Flatline** | Drawdown overlay — halve risk when down -4% or more |
-| **Liquidation Price** | Crypto perps — price level where position is force-closed |
-
----
-
-## License
-
-Internal Use Only
-```
+The repository also contains test/probe databases such as `live_state_test.db`, `analysis_runs_test.db`, and other local artifacts. They are not part of the three runtime paths above.

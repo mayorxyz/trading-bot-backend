@@ -15,10 +15,15 @@ def calculate_sl(entry_price, direction, atr, swings, atr_mult=1.5, lookback=5):
     atr_distance = atr * atr_mult
     atr_sl = entry_price - atr_distance if direction == "LONG" else entry_price + atr_distance
 
-    # nearest relevant swing low (LONG) / high (SHORT) in lookback window
+    # Nearest relevant swing low (LONG) / high (SHORT) in lookback window.
+    # The swing must also sit on the correct side of entry — a LONG's stop
+    # belongs BELOW entry, a SHORT's ABOVE. entry_price comes from
+    # find_best_entry (an S/R level, not the last close), so a recent swing can
+    # easily land on the wrong side; using it would invert the stop and produce
+    # a "loss" with positive PnL.
     relevant = [s for s in swings[-lookback:]
-                if (s["type"] == "LOW" and direction == "LONG")
-                or (s["type"] == "HIGH" and direction == "SHORT")]
+                if (s["type"] == "LOW" and direction == "LONG" and s["price"] < entry_price)
+                or (s["type"] == "HIGH" and direction == "SHORT" and s["price"] > entry_price)]
 
     if relevant:
         swing_price = relevant[-1]["price"]
