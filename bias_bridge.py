@@ -1,6 +1,7 @@
 from phase1_primitives import ema_trend_filter
 from phase2_signal_engine import detect_imbalances
 from phase3_orchestration import per_tf_bias, resolve_topdown_bias, detect_regime, tradable
+from phase5_structure_liquidity import classify_structure, classify_liquidity
 
 
 def resolve_bias(df_by_tf: dict) -> dict:
@@ -13,7 +14,8 @@ def resolve_bias(df_by_tf: dict) -> dict:
 
     if not topdown['tradable']:
         return {"direction": None, "trend_aligned": False, "mtf_full_alignment": False,
-                "regime": None, "tradable": False, "topdown": topdown}
+                "regime": None, "tradable": False, "topdown": topdown,
+                "structure": None, "liquidity": None}
 
     lowest_tf_df = list(df_by_tf.values())[-1]
     imb = detect_imbalances(lowest_tf_df)
@@ -22,6 +24,11 @@ def resolve_bias(df_by_tf: dict) -> dict:
     direction = "LONG" if topdown['bias'] == 'bullish' else "SHORT"
     mtf_full_alignment = topdown['aligned_count'] == len(df_by_tf)
 
+    # Structure/liquidity on execution timeframe
+    structure = classify_structure(lowest_tf_df)
+    current_price = lowest_tf_df['close'].iloc[-1] if 'close' in lowest_tf_df.columns else lowest_tf_df['Close'].iloc[-1]
+    liquidity = classify_liquidity(lowest_tf_df, current_price=current_price)
+
     return {
         "direction": direction,
         "trend_aligned": topdown['aligned_count'] >= 2,
@@ -29,4 +36,6 @@ def resolve_bias(df_by_tf: dict) -> dict:
         "regime": regime,
         "tradable": tradable(regime) and topdown['tradable'],
         "topdown": topdown,
+        "structure": structure,
+        "liquidity": liquidity,
     }

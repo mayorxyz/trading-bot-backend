@@ -121,6 +121,8 @@ def classify_skip(reason):
     if reason.startswith("not tradable"):
         return ("bias: regime=consolidation" if "regime=consolidation" in reason
                 else "bias: not aligned")
+    if reason.startswith("low conviction"):
+        return "confluence: low conviction"
     if reason.startswith("no qualifying entry"):
         return "entry: no qualifying S/R level"
     if reason.startswith("sl/tp"):

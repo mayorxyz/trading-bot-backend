@@ -67,6 +67,8 @@ def get_swing_points(df: pd.DataFrame, side_bars: int = 2) -> pd.DataFrame:
         points.append({'index': idx, 'price': h.loc[idx], 'type': 'high'})
     for idx in df.index[sw['swing_low']]:
         points.append({'index': idx, 'price': l.loc[idx], 'type': 'low'})
+    if not points:
+        return pd.DataFrame(columns=['index', 'price', 'type'])
     return pd.DataFrame(points).sort_values('index').reset_index(drop=True)
 
 

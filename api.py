@@ -55,6 +55,7 @@ import backtest
 import live_runner
 import live_store
 import market_data
+import Signal_formatter
 from phase4_risk_journal import TradeJournal
 from pipeline import analyze_pair_with_bias
 
