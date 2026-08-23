@@ -243,59 +243,6 @@ def collect_state(symbol, execution_tf, ts, df_by_tf, result):
     }
 
 
-def _walk_trade(trade, df):
-    """
-    Recompute an in-flight trade's fill/outcome from the candles after it opened.
-
-    Mirrors backtest.check_outcome: the entry is a LIMIT level so it must be
-    touched to fill, then whichever of SL/TP is hit first decides the outcome,
-    and a bar spanning both is scored as the loss because OHLC cannot resolve
-    intrabar order. Stateless — safe to re-run every tick and across restarts.
-
-    Unlike the backtest there is no CHECK_FORWARD_BARS timeout: a real position
-    stays open until SL or TP actually trades.
-
-    Returns (fill_ts, outcome, exit_price, resolved_ts).
-    """
-    fwd = df[df.index > pd.Timestamp(trade["opened_at"])]
-    if fwd.empty:
-        return None, "pending", None, None
-
-    highs = fwd["high"].to_numpy(dtype=float)
-    lows = fwd["low"].to_numpy(dtype=float)
-    idx = fwd.index
-    entry, sl, tp = trade["entry_price"], trade["stop_price"], trade["take_profit"]
-    direction = trade["direction"]
-
-    fill_i = None
-    for i in range(min(len(fwd), MAX_FILL_WAIT_BARS)):
-        if direction == "LONG" and lows[i] <= entry:
-            fill_i = i
-            break
-        if direction == "SHORT" and highs[i] >= entry:
-            fill_i = i
-            break
-
-    if fill_i is None:
-        # Only give up once the full wait window has actually elapsed.
-        return None, ("no_fill" if len(fwd) >= MAX_FILL_WAIT_BARS else "pending"), None, None
-
-    for i in range(fill_i, len(fwd)):
-        h, l = highs[i], lows[i]
-        if direction == "LONG":
-            if l <= sl:
-                return idx[fill_i], "loss", sl, idx[i]
-            if h >= tp:
-                return idx[fill_i], "win", tp, idx[i]
-        else:
-            if h >= sl:
-                return idx[fill_i], "loss", sl, idx[i]
-            if l <= tp:
-                return idx[fill_i], "win", tp, idx[i]
-
-    return idx[fill_i], "open", None, None
-
-
 def resolve_open_live_trades(symbol, df_by_tf):
     """
     Advance every in-flight live trade through trade_manager.advance() and
@@ -338,8 +285,10 @@ def resolve_open_live_trades(symbol, df_by_tf):
             info = live_store.resolve_trade_managed(
                 t["id"], m["outcome"], m["resolved_ts"], m["exit_price"],
                 m["realized_rr"], m["pnl"])
-            changed.append((t["id"], f"{m['outcome']} RR={info['realized_rr']:+.2f}"
-                                     f" ({'; '.join(m['events'])})" if m["events"] else ""))
+            msg = f"{m['outcome']} RR={info['realized_rr']:+.2f}"
+            if m["events"]:
+                msg += f" ({'; '.join(m['events'])})"
+            changed.append((t["id"], msg))
     return changed
 
 

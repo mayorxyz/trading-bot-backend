@@ -24,6 +24,7 @@ import time
 
 BYBIT_REST = "https://api.bybit.com/v5/market/kline"
 BYBIT_INSTRUMENTS = "https://api.bybit.com/v5/market/instruments-info"
+BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
 
 MAX_KLINES_PER_REQUEST = 1000   # Bybit's hard cap
 
@@ -260,6 +261,17 @@ def fetch_instruments(category: str = "spot", timeout: float = 15) -> list:
         seen_cursors.add(cursor)
 
     return out
+
+
+def fetch_tickers(category: str = "spot", timeout: float = 15) -> list:
+    """
+    One ticker row per tradable symbol in `category`, from GET /v5/market/tickers.
+
+    A single call covers every symbol. Spot rows carry lastPrice and
+    price24hPcnt (a fraction as text: "0.0123" means +1.23% over 24h).
+    """
+    result = _get(BYBIT_TICKERS, {"category": category}, timeout=timeout)
+    return result.get("list") or []
 
 
 def fetch_and_save_all(symbol: str = "BTCUSDT", months_back: int = 6,

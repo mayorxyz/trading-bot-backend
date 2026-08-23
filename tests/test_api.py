@@ -25,13 +25,16 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import paths
+
 BASE = os.environ.get("API_BASE", "http://127.0.0.1:8111")
 SYMBOL = os.environ.get("API_SYMBOL", "BTCUSDT")
 # A symbol Bybit lists but we keep no local history for — chart-only path.
 CHART_ONLY_SYMBOL = os.environ.get("API_CHART_SYMBOL", "LINKUSDT")
 SUB_HOURLY = ("1m", "5m", "15m", "30m")
-HERE = os.path.dirname(os.path.abspath(__file__))
-LIVE_DB = os.environ.get("LIVE_DB_PATH", os.path.join(HERE, "live_state_test.db"))
+LIVE_DB = os.environ.get("LIVE_DB_PATH", os.path.join(paths.DATA_DIR, "live_state_test.db"))
 
 
 def call(method, path, timeout=30):

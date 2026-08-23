@@ -1,5 +1,10 @@
 # debug_check.py — paste in same folder, run: python debug_check.py
+import os
 import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from zigzag import get_zigzag_swings
 from support_resistance import find_sr_levels
 from entry import find_best_entry

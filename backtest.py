@@ -13,6 +13,9 @@ import numpy as np
 from pipeline import analyze_pair_with_bias
 from phase4_risk_journal import TradeJournal
 
+import paths
+import trade_manager
+
 SYMBOL = "BTCUSDT"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT", "DOGEUSDT"]
 EXECUTION_TF = "1H"
@@ -23,10 +26,11 @@ LEVEL_COOLDOWN_BARS = 24  # a level is barred for this long after its trade clos
 LEVEL_BAND_PCT = 0.0025   # entries within 0.25% are treated as the same S/R zone
 MAX_CONCURRENT_POSITIONS = 3  # per symbol, and only ever on distinct S/R zones
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+DATA_DIR = paths.DATA_DIR
 
-# Keep the DB beside this file — "/tmp" is not a valid path on Windows.
-BACKTEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_signals.db")
+# Pipeline logging lands beside the other databases in data/ (see paths.py) —
+# "/tmp" is not a valid path on Windows.
+BACKTEST_DB = paths.BACKTEST_LOG_DB
 
 
 def load_data(symbol=SYMBOL):
@@ -96,6 +100,89 @@ def check_outcome(df_1h, signal_idx_pos, direction, entry, sl, tp,
                 return "win", tp, i - fill_i, bars_to_fill
 
     return "timeout", None, end - fill_i, bars_to_fill
+
+
+# Build #5: when True (default), resolutions run through
+# trade_manager.advance — the SAME two-step management live uses (half off at
+# TP1, breakeven ratchet, chandelier trail), so /analyze numbers and
+# /live/stats are finally the same currency. Set BACKTEST_MANAGED_EXITS=0 for
+# the legacy flat SL/TP walk (kept for A/B comparison).
+MANAGED_EXITS = os.environ.get("BACKTEST_MANAGED_EXITS", "1") != "0"
+
+
+def check_outcome_managed(df_1h, signal_idx_pos, direction, entry, sl, tp,
+                          max_fill_wait=MAX_FILL_WAIT_BARS,
+                          max_forward=CHECK_FORWARD_BARS):
+    """
+    check_outcome's contract, resolved by trade_manager.advance().
+
+    Horizon parity with the flat walk: the manager only ever sees bars up to
+    signal + max_fill_wait + max_forward, so 'open' at the cut maps to the
+    same 'timeout' bucket. Fill semantics are identical (limit must be
+    touched within max_fill_wait).
+
+    Returns a dict:
+        outcome   'win' | 'loss' | 'timeout' | 'no_fill'
+        exit_price, bars_held, bars_to_fill   (None/0 where not applicable)
+        realized_rr, pnl                     (managed combined-R, on win/loss)
+        events                               (manager trail, e.g. TP1 fill)
+    """
+    n = len(df_1h)
+    end_excl = min(n, signal_idx_pos + 1 + max_fill_wait - 1 + max_forward + 1)
+    df_view = df_1h.iloc[:end_excl]
+
+    trade = {
+        "opened_at": df_1h.index[signal_idx_pos],
+        "entry_price": entry,
+        "stop_price": sl,
+        "take_profit": tp,
+        "direction": direction,
+        "tp1_filled": False,
+        "stop_current": None,
+    }
+    m = trade_manager.advance(trade, df_view, max_fill_wait=max_fill_wait)
+
+    def _abs(ts):
+        return int(df_view.index.get_loc(ts)) if ts is not None else None
+
+    fill_abs = _abs(m.get("fill_ts"))
+    bars_to_fill = (fill_abs - signal_idx_pos) if fill_abs is not None else None
+
+    # Parity with the flat walk: an entry that never got touched is
+    # 'no_fill' — including when the data ends before the full wait window
+    # elapses. 'timeout' only ever applies AFTER a fill.
+    if fill_abs is None:
+        return {"outcome": "no_fill", "exit_price": None, "bars_held": 0,
+                "bars_to_fill": None, "realized_rr": None, "pnl": None,
+                "events": []}
+    if m["outcome"] in ("pending", "open"):
+        held = (_abs(m.get("resolved_ts")) or end_excl - 1) - fill_abs
+        return {"outcome": "timeout", "exit_price": None, "bars_held": held,
+                "bars_to_fill": bars_to_fill, "realized_rr": None,
+                "pnl": None, "events": m["events"]}
+
+    res_abs = _abs(m.get("resolved_ts"))
+    return {
+        "outcome": m["outcome"],
+        "exit_price": m["exit_price"],
+        "bars_held": (res_abs - fill_abs) if res_abs is not None and fill_abs is not None else 0,
+        "bars_to_fill": bars_to_fill,
+        "realized_rr": m["realized_rr"],
+        "pnl": m["pnl"],
+        "events": m["events"],
+    }
+
+
+def evaluate_outcome(df_1h, signal_idx_pos, direction, entry, sl, tp):
+    """Dispatch to managed or flat resolution; always returns one dict shape."""
+    if MANAGED_EXITS:
+        return check_outcome_managed(df_1h, signal_idx_pos, direction,
+                                     entry, sl, tp)
+    outcome, exit_price, bars_held, bars_to_fill = check_outcome(
+        df_1h, signal_idx_pos, direction, entry, sl, tp)
+    return {"outcome": outcome, "exit_price": exit_price,
+            "bars_held": bars_held, "bars_to_fill": bars_to_fill,
+            "realized_rr": None, "pnl": None, "events": []}
 
 
 def level_key(price):
@@ -269,9 +356,11 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
         if any(d != result["direction"] for _, d in open_positions.values()):
             c["opposing_concurrent"] += 1
 
-        outcome, exit_price, bars_held, bars_to_fill = check_outcome(
+        oc = evaluate_outcome(
             df_1h, pos, result["direction"], result["entry"], result["sl"], result["tp"]
         )
+        outcome, exit_price = oc["outcome"], oc["exit_price"]
+        bars_held, bars_to_fill = oc["bars_held"], oc["bars_to_fill"]
         if outcome == "no_fill":
             c["no_fill"] += 1
             # A working order still occupies its slot until it expires, and the
@@ -293,19 +382,27 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
 
         pnl = (exit_price - result["entry"]) if result["direction"] == "LONG" else (result["entry"] - exit_price)
         realized_rr = pnl / abs(result["entry"] - result["sl"]) if result["entry"] != result["sl"] else 0
+        if oc["realized_rr"] is not None:
+            # Managed resolution: combined-R comes from the manager (TP1 half
+            # + trailed remainder); trust it over the flat re-derivation.
+            realized_rr = oc["realized_rr"]
+            pnl = oc["pnl"]
 
         trade_id += 1
         c["trades"] += 1
         d = by_dir[result["direction"]]
         d[outcome] += 1
         d["rr"] += realized_rr
+        notes = f"confidence={result['confidence']}"
+        if oc["events"]:
+            notes += " | " + "; ".join(oc["events"])
         journal.log_trade(
             trade_id=trade_id, timestamp=ts, pair=symbol, direction=result["direction"],
             entry_model="pipeline", htf_poi_tf="1D", poi_id=f"bt_{trade_id}",
             entry_price=result["entry"], stop_price=result["sl"], take_profit=result["tp"],
             stop_distance=abs(result["entry"] - result["sl"]), planned_rr=result["rr"],
             realized_rr=realized_rr, risk_pct_used=0.01, position_size=None,
-            outcome=outcome, pnl=pnl, balance_after=None, notes=f"confidence={result['confidence']}",
+            outcome=outcome, pnl=pnl, balance_after=None, notes=notes,
         )
         if verbose:
             print(f"[{symbol} {ts}] {result['direction']} entry={result['entry']:.4f} -> {outcome} "

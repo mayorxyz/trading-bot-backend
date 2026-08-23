@@ -23,13 +23,16 @@ import sys
 
 import pandas as pd
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import live_runner
 import live_store
 from backtest import load_data, slice_up_to
+import paths
 
 # Use a scratch DB so a real live_state.db is never clobbered by the test.
-TEST_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_state_test.db")
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+TEST_DB = os.path.join(paths.DATA_DIR, "live_state_test.db")
+DATA_DIR = paths.DATA_DIR
 
 START_POS = 3600     # late enough that there is plenty of history
 N_TICKS = 14

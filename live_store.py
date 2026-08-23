@@ -32,10 +32,9 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-LIVE_DB = os.environ.get(
-    "LIVE_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_state.db"),
-)
+import paths
+
+LIVE_DB = paths.LIVE_DB
 
 # How long a tick snapshot survives. This is a live hand-off buffer, so hours,
 # not days — long enough to ride out an api.py restart or a quiet market, short
@@ -368,7 +367,7 @@ def open_trade(tick_id, symbol, timeframe, direction, opened_at, entry_price,
         (tick_id, symbol, timeframe, direction, opened_at, entry_price, stop_price,
          take_profit, stop_distance, planned_rr, outcome, confluence, notes,
          tp1_price, stop_current)
-        VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?)
     """, (tick_id, symbol, timeframe, direction, _iso(opened_at), entry_price,
           stop_price, take_profit, abs(entry_price - stop_price), planned_rr,
           confluence, notes, tp1_price, stop_price))
@@ -600,12 +599,26 @@ def live_stats(symbol=None, db_path=None):
         "SELECT COUNT(*) FROM live_trades WHERE outcome IN ('pending','open')"
         + (" AND symbol=?" if symbol else ""), params
     ).fetchone()[0]
+
+    # "Today" is UTC and counts RESOLUTIONS (resolved_at), because that is when
+    # the R was actually banked — an open trade from this morning has no
+    # outcome yet. pnl stays in price-delta units (rr * stop distance); it is
+    # not account USD, since position size is not modelled.
+    today = datetime.now(timezone.utc).date().isoformat()
+    tsql = ("SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM live_trades "
+            "WHERE outcome IN ('win','loss') AND substr(resolved_at, 1, 10)=?")
+    tparams = [today]
+    if symbol:
+        tsql += " AND symbol=?"
+        tparams.append(symbol)
+    trades_today, today_pnl = conn.execute(tsql, tparams).fetchone()
     conn.close()
 
     if not rows:
         return {"symbol": symbol, "total_trades": 0, "in_flight_trades": in_flight,
                 "win_rate": None, "avg_rr": None, "profit_factor_R": None,
-                "wins": 0, "losses": 0}
+                "wins": 0, "losses": 0,
+                "trades_today": trades_today, "today_pnl": float(today_pnl)}
 
     rr = [r["realized_rr"] for r in rows if r["realized_rr"] is not None]
     wins = [r for r in rows if r["outcome"] == "win"]
@@ -622,6 +635,45 @@ def live_stats(symbol=None, db_path=None):
         "avg_rr": (sum(rr) / len(rr)) if rr else None,
         "profit_factor_R": (gross_win / gross_loss) if gross_loss > 0
                            else (float("inf") if gross_win > 0 else None),
+        "trades_today": trades_today,
+        "today_pnl": float(today_pnl),
+    }
+
+
+# How long after the newest tick we still call the runner alive. The runner
+# ticks on every confirmed 1H/15M close, so an hour of quiet market is normal;
+# two hours without any tick means the process is almost certainly down.
+RUNNER_STALE_AFTER = float(os.environ.get("LIVE_RUNNER_STALE_AFTER", 7200))
+
+
+def runner_heartbeat(db_path=None, stale_after=None) -> dict:
+    """
+    Is the live_runner process alive? Inferred from the age of the newest tick:
+    the runner writes one per confirmed trigger-TF close, so a fresh timestamp
+    is proof of life and a very old one means it is not running (or cannot
+    reach Bybit). 'never_run' distinguishes a clean first boot from a dead one.
+    """
+    hours = RUNNER_STALE_AFTER if stale_after is None else float(stale_after)
+    init_db(db_path)
+    conn = _connect(db_path)
+    row = conn.execute("SELECT MAX(recorded_at) FROM live_ticks").fetchone()
+    conn.close()
+
+    newest = row[0] if row else None
+    status = "never_run"
+    age = None
+    if newest:
+        ts = pd.Timestamp(newest)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        age = max(0.0, (datetime.now(timezone.utc) - ts.to_pydatetime())
+                  .total_seconds())
+        status = "running" if age <= hours else "stale"
+    return {
+        "status": status,                       # running | stale | never_run
+        "last_tick_age_seconds": round(age, 1) if age is not None else None,
+        "stale_after_seconds": hours,
+        "newest_tick_recorded_at": newest,
     }
 
 

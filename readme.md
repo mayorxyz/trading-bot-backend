@@ -8,6 +8,22 @@ Python backend for structural market analysis, live Bybit candle processing, his
 
 All three use the same core `pipeline.py` logic where applicable, but they do not share data with one another. The live database is not an analysis archive, analysis jobs do not feed live state, and `/predict` has no storage side effect.
 
+## Repository Layout
+
+```text
+trading-bot-backend/
+├── paths.py          # single source of truth for every read/write location
+├── *.py              # production source (pipeline, engines, live, api)
+├── tests/            # CLI verification scripts
+└── data/             # ALL runtime artifacts - never edited by hand
+    ├── *.csv         # historical candle history (backtest input / chart fallback)
+    ├── *.db          # the four runtime databases below
+    ├── archive/      # stale probe/test databases kept out of the way
+    └── logs/         # captured console output
+```
+
+`paths.py` defines `DATA_DIR` and the four database locations; every consumer imports from it instead of hardcoding a path. All locations are env-overridable (`DATA_DIR`, `LIVE_DB_PATH`, `ANALYSIS_DB_PATH`, `SIGNALS_DB_PATH`, `BACKTEST_LOG_DB_PATH`), which is how tests point the stack at scratch files.
+
 ## How It Fits Together
 
 ### LIVE path
@@ -41,10 +57,11 @@ Each row identifies the file's role, direct callers/importers, direct callees/de
 
 | File | Role | Called by | Calls / depends on | Storage touched |
 |---|---|---|---|---|
-| `analysis_store.py` | Persists queued analysis jobs, status, summaries, and completed trades. | `api.py` | `sqlite3`, `pandas`, JSON serialization. | Reads/writes `analysis_runs.db`; no `live_state.db` or CSV. |
+| `paths.py` | Single source of truth for the data directory and all four database locations; env-overridable, creates `data/` on import. | `live_store.py`, `analysis_store.py`, `signal_store.py`, `backtest.py`, `pipeline.py`, `tests/test_api.py`, `tests/test_live_persistence.py`. | `os`. | Creates `data/` if missing; writes nothing itself. |
+| `analysis_store.py` | Persists queued analysis jobs, status, summaries, and completed trades. | `api.py` | `sqlite3`, `pandas`, JSON serialization, `paths.py`. | Reads/writes `data/analysis_runs.db`; no `live_state.db` or CSV. |
 | `api.py` | FastAPI HTTP surface for health, symbols, live state, charts, backtests, and prediction. | Uvicorn/HTTP clients. | `analysis_store.py`, `backtest.py`, `live_runner.py`, `live_store.py`, `market_data.py`, `phase4_risk_journal.py`, `pipeline.py`; pandas. | Reads local `data/*.csv`; reads/writes `analysis_runs.db` indirectly; reads `live_state.db` indirectly; `/predict` persists nothing. |
-| `backtest.py` | Loads historical candles, replays bars, simulates SL/TP outcomes, and summarizes results. | `api.py`, `profile_pipeline.py`; `live_runner.py` imports constants. | `pipeline.py`, `phase4_risk_journal.py`, pandas, NumPy. | Reads `data/{symbol}_{1d,4h,1h}.csv`; pipeline logging uses `backtest_signals.db`; no `live_state.db` or `analysis_runs.db` directly. |
-| `bias_bridge.py` | Adapts Phase 1-3 calculations into the pipeline's tradable direction/bias result. | `pipeline.py`. | `phase1_primitives.py`, `phase2_signal_engine.py`, `phase3_orchestration.py`. | None. |
+| `backtest.py` | Loads historical candles, replays bars, simulates outcomes, and summarizes results. Resolutions run through `trade_manager.advance()` by default (BACKTEST_MANAGED_EXITS=0 reverts to the legacy flat SL/TP walk), so analysis numbers use the same two-step rules as live; fill/timeout horizon semantics preserved. | `api.py`, `profile_pipeline.py`; `live_runner.py` imports constants; `tests/test_live_persistence.py`. | `pipeline.py`, `phase4_risk_journal.py`, `trade_manager.py`, `paths.py`, pandas, NumPy. | Reads `data/{symbol}_{tf}.csv` history; pipeline logging writes `data/backtest_signals.db` via `paths.py`; no `live_state.db` or `analysis_runs.db` directly. |
+| `bias_bridge.py` | Adapts Phase 1-3 (+5) calculations into the pipeline's tradable direction/bias result; every heavy component (EMA bias, imbalances, regime, structure, liquidity) is memoized per immutable-frame fingerprint via memokv, so backtest steps that share a 1D/4H bar reuse them byte-identically. | `pipeline.py`. | `phase1_primitives.py`, `phase2_signal_engine.py`, `phase3_orchestration.py`, `phase5_structure_liquidity.py`, `memokv.py`. | None. |
 | `breakout_engine.py` | Standalone key-level breakout engine: consolidation trendlines, shape labels, momentum-candle/volume/base-volatility/trend filters, entry/stop, TP1 + chandelier plan, and a 0-100 breakout quality score. | `pipeline.py`. | NumPy only; no project imports. | None. |
 | `elliott_wave.py` | Elliott Wave rule validator + position-in-count locator: 5 unbreakable rules as hard gates, fib retracement/extension/equality/alternation scoring, RSI+MACD wave-5 divergence, recency guard, A-B-C correction context, and a 0-100 quality score. | `pipeline.py`. | `fibonacci.py` shared utilities (find_swings/calculate_rsi/calculate_ema), NumPy. | None. |
 | `structure_retest.py` | Derives the most recently broken structural level from phase5 BOS events and runs the break-and-retest/momentum machinery against it — BOS retest entries as an engine. | `pipeline.py`. | `pattern_strategy.py` (momentum_candle, detect_break_and_retest, calculate_atr, build_trade_plan), NumPy. | None. |
@@ -58,29 +75,30 @@ Each row identifies the file's role, direct callers/importers, direct callees/de
 | `entry.py` | Selects the strongest directional S/R entry level. | `pipeline.py`; `test.py`. | Input S/R levels; no imported project module. | None. |
 | `ingestion.py` | Minimal standalone Bybit WebSocket candle listener/printer. | CLI only; no repository importer. | `asyncio`, `websockets`, JSON. | None. |
 | `ingestion_analysis.py` | Standalone rolling WebSocket analysis with TA-Lib patterns, RSI, and ATR. | CLI only; no repository importer. | Bybit REST prefill, `websockets`, TA-Lib, NumPy. | None. |
-| `ingestion_bybit.py` | Bybit REST kline/instrument fetcher and optional CSV exporter. | `live_runner.py`, `market_data.py`; CLI. | `requests`, pandas, filesystem. | `fetch_and_save_all()` writes CSVs; other functions do not touch `live_state.db` or `analysis_runs.db`. |
+| `ingestion_bybit.py` | Bybit REST kline/instrument/ticker fetcher and optional CSV exporter. | `live_runner.py`, `market_data.py`; CLI. | `requests`, pandas, filesystem. | `fetch_and_save_all()` writes CSVs; other functions do not touch `live_state.db` or `analysis_runs.db`. |
 | `live_runner.py` | Seeds Bybit data, consumes the live WebSocket, runs live analysis, and writes snapshots/trades; advances open positions through trade_manager (TP1/breakeven/chandelier). | CLI process; `api.py` imports constants/helpers. | `ingestion_bybit.py`, `pipeline.py`, `live_store.py`, `trade_manager.py`, `backtest.py` constants, Phases 1-3, `consolidation.py`, `support_resistance.py`, `zigzag.py`, `websockets`. | Writes `live_state.db` through `live_store.py`; no CSV reads in the live seed/stream path and no `analysis_runs.db`. |
-| `live_store.py` | Owns the rolling SQLite hand-off store for live snapshots, overlays, skips, and trades; trades carry managed-state columns (tp1_filled/tp1_price/stop_current/exit_price) via idempotent migration. | `live_runner.py`, `api.py`, `test_live_persistence.py`. | `sqlite3`, pandas, JSON, datetime. | Reads/writes `live_state.db`; purges old snapshots while retaining live trades; no analysis CSV path. |
-| `market_data.py` | Caches Bybit candles, instrument symbols, and timeframe metadata for API charts. | `api.py`. | `ingestion_bybit.py`, pandas, threading/time. | In-memory caches only; no DB or CSV. |
+| `live_store.py` | Owns the rolling SQLite hand-off store for live snapshots, overlays, skips, and trades; trades carry managed-state columns (tp1_filled/tp1_price/stop_current/exit_price) via idempotent migration; exposes today's resolved-trade counts and a runner heartbeat inferred from newest-tick age. | `live_runner.py`, `api.py`, `tests/test_live_persistence.py`. | `sqlite3`, pandas, JSON, datetime, `paths.py`. | Reads/writes `data/live_state.db` via `paths.py`; purges old snapshots while retaining live trades; no analysis CSV path. |
+| `market_data.py` | Caches Bybit candles, instrument symbols, ticker snapshots (last price / 24h change), and timeframe metadata for API charts. | `api.py`. | `ingestion_bybit.py`, pandas, threading/time. | In-memory caches only; no DB or CSV. |
+| `memokv.py` | Process-local LRU memo for pure functions of immutable (closed-bar) frames; the shared store behind pipeline and bias-bridge artifact caching. | `pipeline.py`, `bias_bridge.py`. | `collections`, `threading`, `os`. | In-memory only. |
 | `multi_pair_scanner.py` | Standalone multi-pair pattern, Fibonacci, and trend scanner. | CLI only; optional import attempt from `multi_timeframe_analysis.py`. | `requests`, TA-Lib, NumPy. | None. |
 | `multi_timeframe_analysis.py` | Standalone multi-timeframe pattern, trend, RSI, and Fibonacci analysis. | CLI only; optional import attempt from `multi_pair_scanner.py`. | `requests`, TA-Lib, NumPy. | None. |
 | `pattern_detector.py` | Runs TA-Lib candlestick recognizers and summarizes active bullish/bearish patterns. | `pipeline.py`. | TA-Lib, pandas, NumPy. | None. |
-| `pattern_stats.py` | Queries completed signal win rates by pattern, pair, and timeframe. | No production importer found; CLI/library use. | `signal_store.py` database path, `sqlite3`. | Reads `signals.db` by default; no `live_state.db`, `analysis_runs.db`, or CSV. |
+| `pattern_stats.py` | Queries completed signal win rates by pattern, pair, and timeframe (occurrences, wins, win_rate, avg planned R:R). | `api.py` (`GET /patterns/stats`). | `signal_store.py` database path, `sqlite3`. | Reads `data/signals.db` via `paths.py`; no `live_state.db`, `analysis_runs.db`, or CSV. |
 | `phase1_primitives.py` | Computes candle primitives, fractal swings, and EMA trend/bias features. | `phase2_signal_engine.py`, `bias_bridge.py`, `phase5_structure_liquidity.py`, `live_runner.py`. | pandas, NumPy. | None. |
 | `phase2_signal_engine.py` | Detects FVG/imbalances, double rejection, tested zones, and sweep/break behavior. | `phase3_orchestration.py`, `bias_bridge.py`, `live_runner.py`, `phase5_structure_liquidity.py`. | `phase1_primitives.py`, pandas, NumPy. | None. |
 | `phase3_orchestration.py` | Classifies regime, resolves top-down bias, and supports VSSR/opposing-imbalance logic. | `bias_bridge.py`, `live_runner.py`; internal demo. | `phase2_signal_engine.py` and Phase 1 EMA logic. | None. |
 | `phase4_risk_journal.py` | Provides in-memory risk management, position sizing, trade journaling, and statistics. | `backtest.py`, `api.py`; standalone demo. | pandas, dataclasses, datetime. | No direct DB/CSV access; its journal is in memory. |
 | `phase5_structure_liquidity.py` | Detects market structure, BOS/TC, MSS-related structure, liquidity, and market phase. | No production importer; standalone demo. | `phase1_primitives.py`, `phase2_signal_engine.py`. | None. |
-| `phase6_supplementary.py` | Provides break-even, leverage/liquidation, cost, MSS, news/session, and compounding helpers. | No production importer; standalone demo. | pandas, NumPy, datetime; caller-provided event data. | None. |
-| `pipeline.py` | Shared core pipeline: bias, swings, S/R, zones, breakouts, wicks, volume, entry, SL/TP, validation, confluence (16 inputs incl. scaled fib/breakout/elliott/session scores and a low-conviction gate defaulting to 50), chart-pattern setup, retracement and BOS-retest analysis, and optional signal logging. | `api.py`, `backtest.py`, `live_runner.py`, `profile_pipeline.py`. | `zigzag.py`, `support_resistance.py`, `consolidation.py`, `breakouts.py`, `wicks.py`, `entry.py`, `sl_tp.py`, `validity.py`, `confluence.py`, `volume.py`, `signal_store.py`, `bias_bridge.py`, `pattern_detector.py`, `pattern_strategy.py`, `retracement.py`, `fibonacci.py`, `breakout_engine.py`, `elliott_wave.py`, `structure_retest.py`. | Writes the caller-selected signal DB, default `signals.db`; `db_path=None` writes nothing; no CSV. |
+| `phase6_supplementary.py` | Provides break-even, leverage/liquidation, cost, MSS (bounded to the post-BOS segment — current shift only), news/session, and compounding helpers. | `pipeline.py`. | pandas, NumPy, datetime; caller-provided event data. | None. |
+| `pipeline.py` | Shared core pipeline: bias, swings, S/R, zones, breakouts, wicks, volume, entry, SL/TP, validation, confluence (16 inputs incl. scaled fib/breakout/elliott/session scores and a low-conviction gate defaulting to 50; MSS is a weighted input only, never a veto), chart-pattern setup, retracement and BOS-retest analysis, per-bar memoization of bias/candidate/engine artifacts, bound-pruned engine evaluation (engines skipped once the weighted-sum upper bound proves the verdict; `PIPELINE_ENGINE_PRUNE=0` disables), and optional signal logging. | `api.py`, `backtest.py`, `live_runner.py`, `profile_pipeline.py`. | `zigzag.py`, `support_resistance.py`, `consolidation.py`, `breakouts.py`, `wicks.py`, `entry.py`, `sl_tp.py`, `validity.py`, `confluence.py`, `volume.py`, `signal_store.py`, `bias_bridge.py`, `pattern_detector.py`, `pattern_strategy.py`, `retracement.py`, `fibonacci.py`, `breakout_engine.py`, `elliott_wave.py`, `structure_retest.py`, `paths.py`. | Writes the caller-selected signal DB, default `data/signals.db` via `paths.py`; `db_path=None` writes nothing; no CSV. |
 | `profile_pipeline.py` | Profiles representative backtest/pipeline execution points. | CLI only. | `backtest.py`, `pipeline.py`, `cProfile`, `pstats`. | Reads historical CSVs through `backtest.py`; pipeline logging uses `backtest_signals.db`. |
-| `signal_store.py` | Creates and updates the SQLite signal ledger, including pending and closed outcomes. | `pipeline.py`; `pattern_stats.py` imports its default path. | `sqlite3`, datetime. | Reads/writes configurable DB, default `signals.db`; not `live_state.db` or `analysis_runs.db`. |
+| `signal_store.py` | Creates and updates the SQLite signal ledger, including pending and closed outcomes. | `pipeline.py`; `pattern_stats.py` imports its default path. | `sqlite3`, datetime, `paths.py`. | Reads/writes `data/signals.db` via `paths.py` (absolute — the old cwd-relative default silently depended on the launch directory); not `live_state.db` or `analysis_runs.db`. |
 | `sl_tp.py` | Calculates stop-loss and take-profit levels from ATR, swings, S/R, and fallback R:R. | `pipeline.py`. | Caller-provided ATR, swings, and S/R; no imported project module. | None. |
 | `support_resistance.py` | Clusters swing points into S/R levels and finds nearest levels. | `pipeline.py`, `live_runner.py`; `test.py`. | NumPy; caller-provided swing data. | None. |
-| `test.py` | Ad hoc synthetic check for zigzag, S/R, and entry helpers. | CLI only. | `zigzag.py`, `support_resistance.py`, `entry.py`. | None. |
-| `test_api.py` | Black-box HTTP checks for API routes, Bybit chart behavior, validation, and storage separation. | CLI only; requires Uvicorn. | `urllib`, SQLite, running API. | Reads test live state and documents test analysis DB paths; does not create application rows itself. |
-| `test_connection.py` | One-shot Bybit server-time connectivity probe. | CLI only. | `requests`. | None. |
-| `test_live_persistence.py` | Replays historical candles through live persistence and checks retention/data integrity. | CLI only. | `live_runner.py`, `live_store.py`, backtest CSV loaders, pandas, SQLite. | Reads `data/*.csv`; writes scratch `live_state_test.db`; no production analysis DB. |
+| `tests/test.py` | Ad hoc synthetic check for zigzag, S/R, and entry helpers. | CLI only. | `zigzag.py`, `support_resistance.py`, `entry.py`. | None. |
+| `tests/test_api.py` | Black-box HTTP checks for API routes, Bybit chart behavior, validation, and storage separation. | CLI only; requires Uvicorn. | `urllib`, SQLite, `paths.py`, running API. | Reads test live state (default `data/live_state_test.db`, env-overridable) and documents test analysis DB paths; does not create application rows itself. |
+| `tests/test_connection.py` | One-shot Bybit server-time connectivity probe. | CLI only. | `requests`. | None. |
+| `tests/test_live_persistence.py` | Replays historical candles through live persistence and checks retention/data integrity. | CLI only. | `live_runner.py`, `live_store.py`, backtest CSV loaders, `paths.py`, pandas, SQLite. | Reads `data/*.csv`; writes scratch `data/live_state_test.db`; no production analysis DB. |
 | `validity.py` | Checks trade direction, stop/target validity, R:R, and distance constraints. | `pipeline.py`. | Input trade and current price; no imported project module. | None. |
 | `volume.py` | Detects volume spikes and price-volume divergence. | `pipeline.py`. | NumPy. | None. |
 | `wicks.py` | Detects rejection wicks and matches recent wick events to S/R levels. | `pipeline.py`. | NumPy; caller-provided S/R. | None. |
@@ -88,12 +106,14 @@ Each row identifies the file's role, direct callers/importers, direct callees/de
 
 ## API Endpoints
 
-- `GET /health` - Returns API status, configured DB paths, live retention information, and market-data cache diagnostics.
-- `GET /symbols` - Lists Bybit/local symbols, chart timeframes, local timeframes, and whether local analysis history is available.
-- `GET /live/state` - Returns the latest live tick, timeframe state, bias, signal/skip information, recent skips, and overlay freshness.
+- `GET /health` - Returns API status, configured DB paths (`paths` block), runner heartbeat (`runner`: running/stale/never_run inferred from newest-tick age), `db_freshness_seconds`, live retention information, and market-data cache diagnostics.
+- `GET /symbols` - Lists Bybit/local symbols, chart timeframes, local timeframes, local-history flag, and last price / 24h change (fraction) from the cached ticker snapshot when available.
+- `GET /live/state` - Returns the latest live tick, timeframe state, bias, signal/skip information, the parsed `signal` object (full plan + confluence breakdown + engine blocks) when a signal fired, recent skips, and overlay freshness.
 - `GET /live/zones` - Returns current FVG/imbalance and consolidation zones, optionally filtered by timeframe.
 - `GET /live/levels` - Returns current support/resistance levels, optionally filtered by timeframe and ordered by touches.
-- `GET /live/stats` - Returns resolved live-trade win rate, average R:R, profit factor, in-flight count, and recent resolved trades.
+- `GET /live/skips` - Rolling skip history (candle timestamp, classified reason, raw reason) plus all-time per-category counts; the standalone feed behind the skip-log drawer.
+- `GET /live/stats` - Returns resolved live-trade win rate, average R:R, profit factor, in-flight count, trades/today figures, and recent resolved trades.
+- `GET /patterns/stats` - Per-pattern win rates from the signal ledger: occurrences, wins, win_rate (%), avg planned R:R per (pattern, pair, timeframe); `min_occurrences` withholds thin samples.
 - `GET /ohlc` - Returns recent candles oldest-first; source can prefer Bybit, force local CSV, or force Bybit.
 - `POST /analyze` - Validates local `1D`/`4H`/`1H` history, queues a date-bounded backtest, stores the job in `analysis_runs.db`, and returns a job ID.
 - `GET /analyze/status/{job_id}` - Returns queued/running/completed/error state, summary, funnel counts, and completed trades when available.
@@ -129,10 +149,12 @@ For a backend-only setup, run the first two terminals and call the API directly 
 
 ## Storage Boundaries
 
-- `live_state.db` is the rolling live hand-off owned by `live_store.py`.
-- `analysis_runs.db` stores queued `/analyze` jobs and backtest results owned by `analysis_store.py`.
-- `signals.db` is the default pipeline signal ledger owned by `signal_store.py`.
-- `backtest_signals.db` is used when `backtest.py` passes that path to the pipeline.
+All four databases live under `data/` (see `paths.py`); they stay separate FILES so their rows can never mix:
+
+- `data/live_state.db` is the rolling live hand-off owned by `live_store.py`.
+- `data/analysis_runs.db` stores queued `/analyze` jobs and backtest results owned by `analysis_store.py`.
+- `data/signals.db` is the default pipeline signal ledger owned by `signal_store.py`.
+- `data/backtest_signals.db` is used when `backtest.py` passes that path to the pipeline.
 - `data/*.csv` is historical/local candle input for backtests and local chart fallback. `ingestion_bybit.fetch_and_save_all()` can write CSV history.
 
-The repository also contains test/probe databases such as `live_state_test.db`, `analysis_runs_test.db`, and other local artifacts. They are not part of the three runtime paths above.
+Stale probe/test databases are parked in `data/archive/`, captured console output in `data/logs/`. The whole `data/` tree is gitignored — it is runtime state, not source.

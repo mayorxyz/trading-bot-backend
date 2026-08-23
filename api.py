@@ -39,6 +39,7 @@ Design rules baked in here:
   retention window and current contents.
 """
 
+import json
 import math
 import os
 import re
@@ -55,6 +56,9 @@ import backtest
 import live_runner
 import live_store
 import market_data
+import paths
+import pattern_stats
+import signal_store
 import Signal_formatter
 from phase4_risk_journal import TradeJournal
 from pipeline import analyze_pair_with_bias
@@ -345,10 +349,27 @@ def _split_pf(pf):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "live_db": live_store.LIVE_DB,
+    retention = live_store.retention_info()
+    heartbeat = live_store.runner_heartbeat()
+    return {
+        "status": "ok",
+        "live_db": live_store.LIVE_DB,
+        "analysis_db": analysis_store.ANALYSIS_DB,
+        "signals_db": signal_store.DB_PATH,
+        "paths": {
+            "live_db": live_store.LIVE_DB,
             "analysis_db": analysis_store.ANALYSIS_DB,
-            "live_retention": live_store.retention_info(),
-            "market_data": market_data.cache_stats()}
+            "signals_db": signal_store.DB_PATH,
+            "data_dir": paths.DATA_DIR,
+            "logs_dir": os.path.join(paths.DATA_DIR, "logs"),
+        },
+        # Seconds since the newest live tick was written — the UI's staleness
+        # dot. None when the runner has never written a tick.
+        "db_freshness_seconds": heartbeat["last_tick_age_seconds"],
+        "runner": heartbeat,
+        "live_retention": retention,
+        "market_data": market_data.cache_stats(),
+    }
 
 
 @app.get("/symbols")
@@ -372,18 +393,32 @@ def symbols(refresh: bool = Query(False, description="force a Bybit instrument-l
         tradable = set()
         warning = f"Bybit instrument list unavailable — local history only: {exc}"
 
+    # Display enrichment for the symbol switcher. Tickers are one cached Bybit
+    # call; if they fail, price/change24h come back null and the list still
+    # renders — never let cosmetics break symbol discovery.
+    try:
+        tickers = market_data.ticker_snapshots()
+        ticker_warning = None
+    except Exception as exc:
+        tickers = {}
+        ticker_warning = f"ticker snapshot unavailable — no prices shown: {exc}"
+
     chart_tfs = set(market_data.SUPPORTED_TIMEFRAMES)
     out = []
     for sym in sorted(tradable | set(local)):
         local_tfs = local.get(sym, set())
         fetchable = chart_tfs if sym in tradable else set()
+        tk = tickers.get(sym, {})
         out.append({
             "symbol": sym,
             "timeframes": sorted(local_tfs | fetchable, key=_tf_sort_key),
             "local_timeframes": sorted(local_tfs, key=_tf_sort_key),
             "analysis_available": _analysis_ready(sym, local_tfs),
+            "has_local_history": bool(local_tfs),
             "chart_source": ("local+bybit" if (local_tfs and fetchable)
                              else ("bybit" if fetchable else "local")),
+            "price": tk.get("price"),
+            "change24h": tk.get("change24h"),   # fraction: 0.0123 = +1.23%
         })
 
     return {
@@ -392,7 +427,8 @@ def symbols(refresh: bool = Query(False, description="force a Bybit instrument-l
         "analysis_timeframes": list(ANALYSIS_TFS),
         "chart_timeframes": sorted(chart_tfs, key=_tf_sort_key),
         "bybit": market_data.symbol_cache_info(),
-        "warning": warning,
+        "tickers": market_data.ticker_cache_info(),
+        "warning": "; ".join(w for w in (warning, ticker_warning) if w) or None,
         "symbols": out,
     }
 
@@ -415,7 +451,18 @@ def live_state(symbol: str = Query(...), skip_history: int = Query(20, ge=0, le=
         return {"symbol": symbol, "has_state": False,
                 "message": "no live ticks recorded yet — is live_runner.py running?",
                 "timeframes": {}, "recent_skips": [], "skip_reason_counts": {},
+                "signal": None,
                 "overlay_freshness": _overlay_freshness(symbol)}
+
+    # The full pipeline verdict for the latest tick, verbatim as the runner
+    # stored it (direction/entry/sl/tp/rr/confluence_score/confidence/
+    # confluence_breakdown + engine blocks). Null unless signal_fired.
+    signal = None
+    if tick["signal_json"]:
+        try:
+            signal = json.loads(tick["signal_json"])
+        except (json.JSONDecodeError, TypeError):
+            signal = None
 
     return {
         "symbol": symbol,
@@ -431,10 +478,28 @@ def live_state(symbol: str = Query(...), skip_history: int = Query(20, ge=0, le=
         "bias_gate_passed": bool(tick["tradable"]) if tick["tradable"] is not None else None,
         "direction": tick["direction"],
         "signal_fired": tick["signal_json"] is not None,
+        "signal": signal,
         "latest_skip_reason": tick["skip_reason"],
         "latest_skip_reason_raw": tick["skip_reason_raw"],
         "recent_skips": live_store.recent_skips(symbol, limit=skip_history),
         "skip_reason_counts": live_store.skip_reason_counts(symbol),
+    }
+
+
+@app.get("/live/skips")
+def live_skips(symbol: str = Query(...), limit: int = Query(50, ge=1, le=500)):
+    """
+    Rolling skip history for the funnel drawer: every recorded skip reason with
+    its candle timestamp and classified category, newest first, plus all-time
+    per-category counts. Same data /live/state embeds, standalone so a
+    skip-focused UI does not pull the whole snapshot each poll.
+    """
+    symbol = _clean_symbol(symbol)
+    return {
+        "symbol": symbol,
+        "count": limit,
+        "skips": live_store.recent_skips(symbol, limit=limit),
+        "counts": live_store.skip_reason_counts(symbol),
     }
 
 
@@ -756,6 +821,28 @@ def analyze_status(job_id: str, include_trades: bool = Query(True)):
 def analyze_jobs(limit: int = Query(25, ge=1, le=200)):
     """Recent analysis jobs, newest first."""
     return {"jobs": analysis_store.list_jobs(limit)}
+
+
+@app.get("/patterns/stats")
+def patterns_stats(min_occurrences: int = Query(5, ge=1, le=1000)):
+    """
+    Per-pattern win rates from the signal ledger (signals.db), one row per
+    (pattern, pair, timeframe): {pattern, pair, timeframe, occurrences, wins,
+    win_rate (percent), avg_rr (planned R:R)}.
+
+    Only RESOLVED signals count. Rows with fewer than `min_occurrences`
+    samples are withheld — a pattern that fired once and won is noise, not an
+    edge. Empty list means the ledger has no resolved outcomes yet, which is
+    the honest answer until live/predicted signals get their outcomes closed.
+    """
+    signal_store.init_db()
+    rows = pattern_stats.get_stats(min_occurrences=min_occurrences)
+    return {
+        "source": "signals.db",
+        "min_occurrences": min_occurrences,
+        "count": len(rows),
+        "patterns": _json_safe(rows),
+    }
 
 
 # ---------- PREDICT (run the pipeline once on live data) ----------

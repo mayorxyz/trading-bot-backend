@@ -73,25 +73,49 @@ def forex_pip_model(pair: str, price: float, lot_size_units: float) -> dict:
 
 # ---------- 4. MSS (Market Structure Shift) — weak early warning ----------
 
-def detect_mss(structure_events: list, trend: str) -> list:
+def detect_mss(structure_events: list, trend: str,
+               max_recent_events: int = 10) -> list:
     """
-    MSS (bearish, in uptrend): price makes a lower high without breaking last high.
-    MSS (bullish, in downtrend): price makes a higher low without breaking last low.
-    Operates on Phase 5's structure['events'] list; flags swing points that
-    fail to extend the trend (no accompanying BOS).
+    The CURRENT market-structure shift, not every pullback in history.
+
+    A shift only means something relative to the latest confirmed break:
+    swings BEFORE the most recent BOS are history the trend already digested.
+    So we evaluate only the segment AFTER the last BOS (bounded to the most
+    recent `max_recent_events` events when no BOS exists). The old
+    scan-everything behaviour flagged ~250 "shifts" on six months of ADAUSDT
+    1H — one per routine pullback — which let this gate veto nearly every
+    trade.
+
+    MSS (bearish, in uptrend): a lower high that came without its own BOS.
+    MSS (bullish, in downtrend): a higher low that came without its own BOS.
+    Returns a (short) list of event dicts; empty when the trend is intact.
+    Weighted input downstream — never a hard gate.
     """
-    mss_events = []
-    highs = [e for e in structure_events if e['event'] == 'swing_high']
-    lows = [e for e in structure_events if e['event'] == 'swing_low']
+    if not structure_events or trend not in ('uptrend', 'downtrend'):
+        return []
+
+    last_bos = max((i for i, e in enumerate(structure_events)
+                    if 'BOS' in e['event']), default=None)
+    if last_bos is not None:
+        segment = structure_events[last_bos + 1:]
+    else:
+        segment = structure_events[-max_recent_events:]
+    segment = segment[-max_recent_events:]
+
+    highs = [e for e in segment if e['event'] == 'swing_high']
+    lows = [e for e in segment if e['event'] == 'swing_low']
     bos_idxs = {e['idx'] for e in structure_events if 'BOS' in e['event']}
 
+    mss_events = []
     if trend == 'uptrend':
         for i in range(1, len(highs)):
-            if highs[i]['price'] < highs[i - 1]['price'] and highs[i]['idx'] not in bos_idxs:
+            if (highs[i]['price'] < highs[i - 1]['price']
+                    and highs[i]['idx'] not in bos_idxs):
                 mss_events.append({**highs[i], 'event': 'MSS_bear'})
     elif trend == 'downtrend':
         for i in range(1, len(lows)):
-            if lows[i]['price'] > lows[i - 1]['price'] and lows[i]['idx'] not in bos_idxs:
+            if (lows[i]['price'] > lows[i - 1]['price']
+                    and lows[i]['idx'] not in bos_idxs):
                 mss_events.append({**lows[i], 'event': 'MSS_bull'})
     return mss_events
 

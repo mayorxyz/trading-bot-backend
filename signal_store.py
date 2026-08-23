@@ -5,7 +5,11 @@ signal_store.py — SQLite log of every signal + outcome tracking.
 import sqlite3
 from datetime import datetime, timezone
 
-DB_PATH = "signals.db"
+import paths
+
+# Absolute (data/signals.db) — the old cwd-relative default silently wrote
+# wherever the process happened to be started from.
+DB_PATH = paths.SIGNALS_DB
 
 
 def init_db(db_path=DB_PATH):

@@ -1,0 +1,9 @@
+# Runtime artifacts — never in version control.
+__pycache__/
+*.pyc
+data/
+
+# Local env / editor noise
+.env
+.vscode/
+.idea/

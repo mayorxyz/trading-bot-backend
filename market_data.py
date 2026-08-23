@@ -162,6 +162,68 @@ def symbol_cache_info() -> dict:
         }
 
 
+# ---------- tickers (last price / 24h change) ----------
+
+TICKER_TTL = float(os.environ.get("BYBIT_TICKER_TTL", 30))
+
+_tick_lock = threading.Lock()
+_tick_cache = {
+    "map": None,        # {SYMBOL: {"price","change24h"}} | None = never fetched
+    "fetched_at": 0.0,  # time.monotonic()
+    "error": None,      # last refresh failure, even when stale data is served
+}
+
+
+def ticker_snapshots(force_refresh: bool = False) -> dict:
+    """
+    {SYMBOLUPPER: {"price": float|None, "change24h": float|None}} for CATEGORY.
+
+    One Bybit call covers every symbol; cached TICKER_TTL seconds (tickers are
+    display enrichment, not trading input). A failed refresh keeps serving the
+    previous snapshot; a failure with nothing cached returns {} — callers must
+    treat price/change as optional and never block the symbol list on it.
+    """
+    with _tick_lock:
+        age = time.monotonic() - _tick_cache["fetched_at"]
+        if _tick_cache["map"] is not None and not force_refresh and age < TICKER_TTL:
+            return _tick_cache["map"]
+
+        try:
+            rows = ingestion_bybit.fetch_tickers(CATEGORY)
+        except Exception as exc:
+            _tick_cache["error"] = f"{type(exc).__name__}: {exc}"
+            return _tick_cache["map"] or {}
+
+        out = {}
+        for r in rows:
+            sym = (r.get("symbol") or "").upper()
+            if not sym:
+                continue
+
+            def _f(key):
+                v = r.get(key)
+                try:
+                    return float(v) if v not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
+
+            out[sym] = {"price": _f("lastPrice"),
+                        "change24h": _f("price24hPcnt")}
+        _tick_cache.update(map=out, fetched_at=time.monotonic(), error=None)
+        return out
+
+
+def ticker_cache_info() -> dict:
+    with _tick_lock:
+        return {
+            "count": 0 if _tick_cache["map"] is None else len(_tick_cache["map"]),
+            "age_seconds": (None if _tick_cache["map"] is None
+                            else round(time.monotonic() - _tick_cache["fetched_at"], 1)),
+            "refresh_seconds": TICKER_TTL,
+            "error": _tick_cache["error"],
+        }
+
+
 # ---------- recent candles ----------
 
 _ohlc_lock = threading.Lock()

@@ -19,10 +19,9 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-ANALYSIS_DB = os.environ.get(
-    "ANALYSIS_DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "analysis_runs.db"),
-)
+import paths
+
+ANALYSIS_DB = paths.ANALYSIS_DB
 
 # Job lifecycle
 QUEUED, RUNNING, DONE, ERROR = "queued", "running", "done", "error"

@@ -105,7 +105,11 @@ def classify_structure(df: pd.DataFrame, side_bars: int = 2) -> dict:
             tc_events.append({'idx': tc_idx, 'price': breaks.iloc[0], 'event': 'TC_bull'})
 
     events.extend(tc_events)
-    events.sort(key=lambda e: list(df.index).index(e['idx']) if e['idx'] in df.index else 0)
+    # Position lookup built ONCE — the previous lambda called
+    # list(df.index).index(...) per event, rescanning all timestamps every
+    # time (O(events x bars): ~5M iterations on 6 months of 1H history).
+    _pos_of = {ts: i for i, ts in enumerate(df.index)}
+    events.sort(key=lambda e: _pos_of.get(e['idx'], 0))
 
     return {
         'events': events,
