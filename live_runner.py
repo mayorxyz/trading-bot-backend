@@ -27,6 +27,7 @@ from ingestion_bybit import fetch_klines
 from pipeline import analyze_pair_with_bias
 
 import live_store
+import trade_manager
 from backtest import classify_skip, MAX_FILL_WAIT_BARS
 from consolidation import find_consolidation_zones
 from phase1_primitives import ema_trend_filter
@@ -297,8 +298,12 @@ def _walk_trade(trade, df):
 
 def resolve_open_live_trades(symbol, df_by_tf):
     """
-    Advance every in-flight live trade against the latest candles and persist any
-    fills / resolutions. Outcome bookkeeping only — no signal logic here.
+    Advance every in-flight live trade through trade_manager.advance() and
+    persist fills / TP1 flags / ratcheted stops / resolutions.
+
+    The manager implements the engines' two-step plan (half off at TP1 ->
+    breakeven -> chandelier trail); realized_rr on managed rows combines both
+    legs so /live/stats reflects what was actually planned.
     """
     changed = []
     for t in live_store.pending_trades(symbol):
@@ -306,23 +311,35 @@ def resolve_open_live_trades(symbol, df_by_tf):
         if df is None or df.empty:
             continue
         try:
-            fill_ts, outcome, exit_price, resolved_ts = _walk_trade(t, df)
+            m = trade_manager.advance(t, df, max_fill_wait=MAX_FILL_WAIT_BARS)
         except Exception:
             traceback.print_exc()
             continue
 
-        if outcome == "pending":
+        # Persist management state whenever it moved (idempotent between ticks).
+        if (m.get("tp1_filled") != bool(t.get("tp1_filled"))) or \
+                (m.get("stop_current") is not None and
+                 m.get("stop_current") != t.get("stop_current")):
+            live_store.update_trade_management(
+                t["id"], tp1_filled=m.get("tp1_filled"),
+                stop_current=m.get("stop_current"))
+
+        if m["outcome"] == "pending":
             continue
-        if outcome == "no_fill":
+        if m["outcome"] == "no_fill":
             live_store.mark_no_fill(t["id"])
             changed.append((t["id"], "no_fill"))
             continue
 
-        if t["outcome"] == "pending" and fill_ts is not None:
-            live_store.mark_filled(t["id"], fill_ts)
-        if outcome in ("win", "loss"):
-            info = live_store.resolve_trade(t["id"], outcome, resolved_ts, exit_price)
-            changed.append((t["id"], f"{outcome} RR={info['realized_rr']:+.2f}"))
+        if t["outcome"] == "pending" and m.get("fill_ts") is not None:
+            live_store.mark_filled(t["id"], m["fill_ts"])
+
+        if m["outcome"] in ("win", "loss"):
+            info = live_store.resolve_trade_managed(
+                t["id"], m["outcome"], m["resolved_ts"], m["exit_price"],
+                m["realized_rr"], m["pnl"])
+            changed.append((t["id"], f"{m['outcome']} RR={info['realized_rr']:+.2f}"
+                                     f" ({'; '.join(m['events'])})" if m["events"] else ""))
     return changed
 
 

@@ -6,22 +6,24 @@ Higher = more independent signals agree = higher confidence.
 WEIGHTS = {
     "pattern_match": 9,
     "trend_align": 9,
-    "mtf_alignment": 11,
+    "mtf_alignment": 9,
     "sr_level_strength": 7,
-    "wick_rejection": 8,
-    "fib_score": 6,                # 0-100 quality from fibonacci.py (scaled)
-    "volume_confirm": 5,
-    "structure_bos_align": 11,
-    "liquidity_target": 5,
-    "no_mss_conflict": 5,
+    "wick_rejection": 7,
+    "fib_score": 5,                # 0-100 quality from fibonacci.py (scaled)
+    "volume_confirm": 4,
+    "structure_bos_align": 10,
+    "liquidity_target": 4,
+    "no_mss_conflict": 4,
     "chart_pattern_align": 6,      # chart-pattern setup (chart_patterns.py)
-    "retracement_confirm": 5,      # fib-zone pullback entry (retracement.py)
-    "breakout_score": 7,           # 0-100 quality from breakout_engine.py (scaled)
-    "elliott_score": 6,            # 0-100 quality from elliott_wave.py (scaled)
+    "retracement_confirm": 4,      # fib-zone pullback entry (retracement.py)
+    "breakout_score": 6,           # 0-100 quality from breakout_engine.py (scaled)
+    "elliott_score": 5,            # 0-100 quality from elliott_wave.py (scaled)
+    "structure_retest_confirm": 6, # BOS-level retest entry (structure_retest.py)
+    "session_timing": 5,           # 0-100 liquidity window score (scaled)
 }
 
 # Keys scored proportionally to a 0-100 value instead of all-or-nothing.
-SCALED_KEYS = ("fib_score", "breakout_score", "elliott_score")
+SCALED_KEYS = ("fib_score", "breakout_score", "elliott_score", "session_timing")
 
 
 def calculate_confluence(signals: dict) -> dict:
@@ -39,6 +41,8 @@ def calculate_confluence(signals: dict) -> dict:
           "retracement_confirm": bool,
           "breakout_score": int 0-100 (breakout_engine.py quality, scaled),
           "elliott_score": int 0-100 (elliott_wave.py quality, scaled),
+          "structure_retest_confirm": bool,
+          "session_timing": int 0-100 (liquidity window score, scaled),
         }
     Scaled keys contribute weight * (value / 100); booleans contribute the
     full weight when truthy. Returns: {"score": int (0-100), "breakdown": {...}}

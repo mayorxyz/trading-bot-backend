@@ -39,12 +39,13 @@ from volume import detect_volume_spike, detect_volume_divergence
 from signal_store import init_db, log_signal
 from bias_bridge import resolve_bias
 from pattern_detector import get_active_patterns, summarize_bias
-from phase6_supplementary import detect_mss, is_news_blackout
+from phase6_supplementary import detect_mss, is_news_blackout, session_quality
 from pattern_strategy import analyze_pattern_setup
 from retracement import analyze_retracement, compute_fib_score
 from fibonacci import analyze_fibonacci
 from breakout_engine import analyze_breakout
 from elliott_wave import analyze_elliott_wave
+from structure_retest import analyze_structure_retest
 
 
 def _summarize_chart_pattern(setup):
@@ -246,6 +247,43 @@ def analyze_pair_with_bias(pair, timeframe, df_by_tf,
         elliott_info = {"score": 0, "trade_ready": False, "stage": "error",
                         "error": f"{type(e).__name__}: {e}"}
 
+    # ---------------------------------------------------------------------
+    # NEW: Structure-level break-and-retest (structure_retest.py) — turns
+    # phase5's BOS event stream into an entry source, and session liquidity
+    # quality (phase6_supplementary.session_quality) into a scaled input.
+    # ---------------------------------------------------------------------
+    structure_retest_info = {"trade_ready": False, "aligned": False}
+    try:
+        sr_events = (bias.get("structure") or {}).get("events") or []
+        setup = analyze_structure_retest(
+            sr_events, opens, highs, lows, closes,
+            trade_direction=bias["direction"],
+        )
+        structure_retest_info = {
+            "trade_ready": bool(setup.get("trade_ready")),
+            "aligned": bool(setup.get("aligned")),
+            "stage": setup.get("stage"),
+            "direction": setup.get("direction"),
+            "level": setup.get("level"),
+            "entry": (setup.get("plan") or {}).get("entry"),
+            "stop": (setup.get("plan") or {}).get("stop"),
+            "tp1": (setup.get("plan") or {}).get("tp1"),
+            "skip_reason": setup.get("skip_reason"),
+        }
+    except Exception as e:
+        structure_retest_info = {"trade_ready": False, "aligned": False,
+                                 "stage": "error",
+                                 "error": f"{type(e).__name__}: {e}"}
+
+    session_info = {"score": 0, "session": None}
+    try:
+        exec_df = list(df_by_tf.values())[-1]
+        if len(exec_df):
+            session_info = session_quality(exec_df.index[-1])
+    except Exception as e:
+        session_info = {"score": 0, "session": None,
+                        "error": f"{type(e).__name__}: {e}"}
+
     try:
         retr_setup = analyze_retracement(
             opens, highs, lows, closes, volumes,
@@ -270,6 +308,8 @@ def analyze_pair_with_bias(pair, timeframe, df_by_tf,
         fib_info=fib_info,
         breakout_info=breakout_info,
         elliott_info=elliott_info,
+        structure_retest_info=structure_retest_info,
+        session_info=session_info,
         min_confluence_score=min_confluence_score,
     )
 
@@ -280,6 +320,7 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
                   liquidity_target=False, no_mss_conflict=True, db_path="signals.db",
                   chart_pattern_info=None, retracement_info=None,
                   fib_info=None, breakout_info=None, elliott_info=None,
+                  structure_retest_info=None, session_info=None,
                   min_confluence_score=50):
     """
     Core execution logic. Computes structure, entry, SL/TP, and confluence.
@@ -322,6 +363,7 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
     fib_score_val = int(fib_info.get("score") or 0) if fib_info else 0
     breakout_score_val = int(breakout_info.get("score") or 0) if breakout_info else 0
     elliott_score_val = int(elliott_info.get("score") or 0) if elliott_info else 0
+    session_score_val = int(session_info.get("score") or 0) if session_info else 0
 
     score_result = calculate_confluence({
         "pattern_match": pattern_name is not None,
@@ -338,6 +380,8 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
         "retracement_confirm": retracement_confirmed,
         "breakout_score": breakout_score_val,
         "elliott_score": elliott_score_val,
+        "structure_retest_confirm": bool(structure_retest_info and structure_retest_info.get("trade_ready")),
+        "session_timing": session_score_val,
     })
 
     # Conviction gate: weighted evidence decides, not presence of every input.
@@ -353,6 +397,8 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
             "fibonacci": fib_info,
             "breakout_engine": breakout_info,
             "elliott": elliott_info,
+            "structure_retest": structure_retest_info,
+            "session": session_info,
         }
 
     # db_path=None => compute and return WITHOUT logging. 
@@ -397,6 +443,8 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
         "fibonacci": fib_info,
         "breakout_engine": breakout_info,
         "elliott": elliott_info,
+        "structure_retest": structure_retest_info,
+        "session": session_info,
     }
 
 

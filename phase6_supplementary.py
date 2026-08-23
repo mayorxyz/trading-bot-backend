@@ -11,7 +11,7 @@ Phase 6 — Remaining MEDIUM/LOW priority concepts.
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, time
+from datetime import datetime, timezone, time, timedelta
 
 
 # ---------- 1. Break-even management ----------
@@ -152,6 +152,43 @@ def is_favorable_session(pair: str, ny_time: time, is_crypto: bool = False) -> d
     base = pair[:3].upper()
     mapped = PAIR_SESSION_MAP.get(base, ['london', 'ny'])
     return {'favorable': session in mapped, 'session': session, 'mapped_sessions': mapped}
+
+
+# Windows lacks a system tz database; zoneinfo needs the tzdata package there.
+try:
+    from zoneinfo import ZoneInfo
+    _NY_TZ = ZoneInfo("America/New_York")
+except Exception:
+    _NY_TZ = timezone(timedelta(hours=-4))  # EDT approximation fallback
+
+# Folklore map until signals.db outcomes are grouped by hour and tuned.
+SESSION_QUALITY_CRYPTO = {
+    'london': 100,
+    'ny': 100,
+    'asia': 70,
+    'lunch_lull': 45,
+}
+OFF_SESSION_QUALITY = 45
+
+
+def session_quality(ts) -> dict:
+    """
+    0-100 liquidity-quality score for a candle timestamp (naive treated as UTC),
+    plus which NY-time session it fell in. Weekends capped at 50 — thinner books.
+    Weighted confluence input only; never a gate.
+    """
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    local = ts.tz_convert(_NY_TZ)
+
+    session = get_active_session(local.time())
+    score = SESSION_QUALITY_CRYPTO.get(session, OFF_SESSION_QUALITY)
+    if local.weekday() >= 5:
+        score = min(score, 50)
+
+    return {"score": int(score), "session": session,
+            "local_time": local.isoformat()}
 
 
 # ---------- 7. Compounding projection (simulation only) ----------

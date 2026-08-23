@@ -183,8 +183,26 @@ def init_db(db_path=None):
         );
         CREATE INDEX IF NOT EXISTS ix_trades_symbol ON live_trades(symbol, outcome);
     """)
+    _ensure_trade_columns(conn)
     conn.commit()
     conn.close()
+
+
+def _ensure_trade_columns(conn):
+    """
+    Idempotent migration for managed-trade columns (trade_manager.py).
+    Older DBs get the columns added; fresh schemas already have them via
+    CREATE TABLE above — PRAGMA check makes both paths safe.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(live_trades)").fetchall()}
+    if "tp1_filled" not in cols:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN tp1_filled INTEGER DEFAULT 0")
+    if "tp1_price" not in cols:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN tp1_price REAL")
+    if "stop_current" not in cols:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN stop_current REAL")
+    if "exit_price" not in cols:
+        conn.execute("ALTER TABLE live_trades ADD COLUMN exit_price REAL")
 
 
 # ---------- retention ----------
@@ -340,7 +358,7 @@ def record_tick(snapshot, db_path=None) -> int:
 
 def open_trade(tick_id, symbol, timeframe, direction, opened_at, entry_price,
                stop_price, take_profit, planned_rr, confluence=None, notes=None,
-               db_path=None) -> int:
+               tp1_price=None, db_path=None) -> int:
     """Record a fired live signal as a pending trade."""
     init_db(db_path)
     conn = _connect(db_path)
@@ -348,11 +366,12 @@ def open_trade(tick_id, symbol, timeframe, direction, opened_at, entry_price,
     cur.execute("""
         INSERT INTO live_trades
         (tick_id, symbol, timeframe, direction, opened_at, entry_price, stop_price,
-         take_profit, stop_distance, planned_rr, outcome, confluence, notes)
-        VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?)
+         take_profit, stop_distance, planned_rr, outcome, confluence, notes,
+         tp1_price, stop_current)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'pending',?,?,?,?,?)
     """, (tick_id, symbol, timeframe, direction, _iso(opened_at), entry_price,
           stop_price, take_profit, abs(entry_price - stop_price), planned_rr,
-          confluence, notes))
+          confluence, notes, tp1_price, stop_price))
     trade_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -392,7 +411,6 @@ def mark_no_fill(trade_id, db_path=None):
     conn.commit()
     conn.close()
 
-
 def resolve_trade(trade_id, outcome, resolved_at, exit_price, db_path=None):
     """
     Close a pending live trade. realized_rr is derived from the recorded entry
@@ -415,7 +433,49 @@ def resolve_trade(trade_id, outcome, resolved_at, exit_price, db_path=None):
     """, (outcome, _iso(resolved_at), realized_rr, pnl, trade_id))
     conn.commit()
     conn.close()
-    return {"trade_id": trade_id, "outcome": outcome, "realized_rr": realized_rr, "pnl": pnl}
+    return {"trade_id": trade_id, "outcome": outcome,
+            "realized_rr": realized_rr, "pnl": pnl}
+
+
+def update_trade_management(trade_id, tp1_filled=None, stop_current=None,
+                            tp1_price=None, db_path=None):
+    """Persist the manager's ratcheting state between ticks."""
+    sets, params = [], []
+    if tp1_filled is not None:
+        sets.append("tp1_filled=?")
+        params.append(int(bool(tp1_filled)))
+    if stop_current is not None:
+        sets.append("stop_current=?")
+        params.append(float(stop_current))
+    if tp1_price is not None:
+        sets.append("tp1_price=?")
+        params.append(float(tp1_price))
+    if not sets:
+        return
+    params.append(trade_id)
+    conn = _connect(db_path)
+    conn.execute(f"UPDATE live_trades SET {', '.join(sets)} WHERE id=?", params)
+    conn.commit()
+    conn.close()
+
+
+def resolve_trade_managed(trade_id, outcome, resolved_at, exit_price,
+                          realized_rr, pnl, db_path=None):
+    """
+    Close a managed trade whose realized_rr combines the TP1 half and the
+    trailed remainder — the manager computes both, so we store them as given
+    instead of re-deriving a flat SL/TP result.
+    """
+    conn = _connect(db_path)
+    conn.execute("""
+        UPDATE live_trades SET outcome=?, resolved_at=?, exit_price=?, realized_rr=?, pnl=?
+        WHERE id=?
+    """, (outcome, _iso(resolved_at), float(exit_price), float(realized_rr),
+          float(pnl), trade_id))
+    conn.commit()
+    conn.close()
+    return {"trade_id": trade_id, "outcome": outcome,
+            "realized_rr": realized_rr, "pnl": pnl}
 
 
 # ---------- reads (API surface) ----------
