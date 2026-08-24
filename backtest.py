@@ -33,11 +33,39 @@ DATA_DIR = paths.DATA_DIR
 BACKTEST_DB = paths.BACKTEST_LOG_DB
 
 
-def load_data(symbol=SYMBOL):
+def has_execution_csv(symbol, execution_tf="1H"):
+    """Is there local candle history for this symbol + execution timeframe?"""
+    return os.path.exists(os.path.join(
+        DATA_DIR, f"{symbol.lower()}_{execution_tf.lower()}.csv"))
+
+
+def available_execution_tfs(symbol):
+    """Execution timeframes with local CSVs, fastest first ('if present')."""
+    return [tf for tf in ("15M", "30M", "1H", "4H", "1D")
+            if has_execution_csv(symbol, tf)]
+
+
+# Bars-per-hour equivalents, so wall-clock horizons survive a timeframe change.
+_TF_MINUTES = {"15M": 15, "30M": 30, "1H": 60, "4H": 240, "1D": 1440}
+
+
+def load_data(symbol=SYMBOL, execution_tf="1H"):
+    """
+    Load 1D + 4H (bias frames) plus the execution-timeframe candles.
+
+    execution_tf may be '1H' (classic behaviour) or '15M'/'30M' when that CSV
+    is present. Bar-count constants are rescaled by run_symbol so fill/timeout
+    horizons keep their wall-clock meaning across timeframes.
+    """
     def read(tf):
         path = os.path.join(DATA_DIR, f"{symbol.lower()}_{tf}.csv")
         return pd.read_csv(path, index_col=0, parse_dates=True)
-    return read("1d"), read("4h"), read("1h")
+
+    df_1d = read("1d")
+    df_4h = read("4h")
+    if execution_tf.upper() != "1H":
+        return df_1d, df_4h, read(execution_tf.lower())
+    return df_1d, df_4h, read("1h")
 
 
 def slice_up_to(df, ts):
@@ -173,13 +201,18 @@ def check_outcome_managed(df_1h, signal_idx_pos, direction, entry, sl, tp,
     }
 
 
-def evaluate_outcome(df_1h, signal_idx_pos, direction, entry, sl, tp):
+def evaluate_outcome(df_exec, signal_idx_pos, direction, entry, sl, tp,
+                     max_fill_wait=MAX_FILL_WAIT_BARS,
+                     max_forward=CHECK_FORWARD_BARS):
     """Dispatch to managed or flat resolution; always returns one dict shape."""
     if MANAGED_EXITS:
-        return check_outcome_managed(df_1h, signal_idx_pos, direction,
-                                     entry, sl, tp)
+        return check_outcome_managed(df_exec, signal_idx_pos, direction,
+                                     entry, sl, tp,
+                                     max_fill_wait=max_fill_wait,
+                                     max_forward=max_forward)
     outcome, exit_price, bars_held, bars_to_fill = check_outcome(
-        df_1h, signal_idx_pos, direction, entry, sl, tp)
+        df_exec, signal_idx_pos, direction, entry, sl, tp,
+        max_fill_wait=max_fill_wait, max_forward=max_forward)
     return {"outcome": outcome, "exit_price": exit_price,
             "bars_held": bars_held, "bars_to_fill": bars_to_fill,
             "realized_rr": None, "pnl": None, "events": []}
@@ -250,9 +283,18 @@ def _align_tz(ts, index):
 
 
 def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
-               start_date=None, end_date=None):
+               start_date=None, end_date=None, execution_tf="1H",
+               min_confluence_score=50):
     """
     Backtest one symbol into a shared journal.
+
+    execution_tf: '1H' (default), '30M' or '15M' — whichever local CSV exists
+    (see has_execution_csv / available_execution_tfs). Wall-clock horizons are
+    preserved by rescaling the bar-count constants: fill wait and forward
+    horizon grow by 60/tf_minutes so 24 bars on 1H means the same 24 HOURS on
+    15M. LOOKBACK_BARS stays a fixed 200 bars (a shorter history window on
+    lower timeframes) and `step` remains bar-based, so lower timeframes are
+    sampled more densely.
 
     Position state (open_positions, level_blocked_until) is local to this call,
     so concurrency limits apply PER SYMBOL — symbols are treated as independent
@@ -273,37 +315,43 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
 
     Returns (counters, by_dir, next_trade_id).
     """
-    df_1d, df_4h, df_1h = load_data(symbol)
+    df_1d, df_4h, df_exec = load_data(symbol, execution_tf)
+
+    tf_min = _TF_MINUTES.get(execution_tf.upper(), 60)
+    scale = 60.0 / tf_min
+    fill_wait = int(round(MAX_FILL_WAIT_BARS * scale))
+    forward = int(round(CHECK_FORWARD_BARS * scale))
 
     c = _blank_counters()
     by_dir = _blank_dirs()
     trade_id = trade_id_start
-    n = len(df_1h)
+    n = len(df_exec)
 
     # level_key -> (exit_bar, direction) for every position or working order
     # currently occupying a slot.
     open_positions = {}
     level_blocked_until = {}
 
-    lo, hi = LOOKBACK_BARS, n - CHECK_FORWARD_BARS
+    lo, hi = LOOKBACK_BARS, n - forward
     if start_date is not None:
-        lo = max(lo, int(df_1h.index.searchsorted(_align_tz(start_date, df_1h.index), side="left")))
+        lo = max(lo, int(df_exec.index.searchsorted(_align_tz(start_date, df_exec.index), side="left")))
     if end_date is not None:
-        hi = min(hi, int(df_1h.index.searchsorted(_align_tz(end_date, df_1h.index), side="right")))
+        hi = min(hi, int(df_exec.index.searchsorted(_align_tz(end_date, df_exec.index), side="right")))
 
     points = range(lo, hi, step) if hi > lo else range(0)
     c["test_points"] = len(points)
 
     for pos in points:
-        ts = df_1h.index[pos]
+        ts = df_exec.index[pos]
 
         hist_1d = slice_up_to(df_1d, ts)
         hist_4h = slice_up_to(df_4h, ts)
-        hist_1h = df_1h.iloc[:pos + 1]  # up to and including current bar, no future
+        hist_exec = df_exec.iloc[:pos + 1]  # up to and including current bar, no future
 
-        # Counted, not silent: if the HTF CSVs start later than the 1H CSV, every
-        # early 1H bar is unusable and would otherwise vanish without a trace.
-        if len(hist_1d) < 10 or len(hist_4h) < 10 or len(hist_1h) < LOOKBACK_BARS:
+        # Counted, not silent: if the HTF CSVs start later than the execution
+        # CSV, every early bar is unusable and would otherwise vanish without
+        # a trace.
+        if len(hist_1d) < 10 or len(hist_4h) < 10 or len(hist_exec) < LOOKBACK_BARS:
             c["insufficient_htf"] += 1
             continue
 
@@ -314,18 +362,19 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
             c["position_open"] += 1
             continue
 
-        recent = hist_1h.tail(LOOKBACK_BARS)
+        recent = hist_exec.tail(LOOKBACK_BARS)
 
         try:
             result = analyze_pair_with_bias(
-                pair=symbol, timeframe=EXECUTION_TF,
-                df_by_tf={"1D": hist_1d, "4H": hist_4h, "1H": hist_1h},
+                pair=symbol, timeframe=execution_tf,
+                df_by_tf={"1D": hist_1d, "4H": hist_4h, "1H": hist_exec},
                 opens=recent["open"].to_numpy(dtype=float),
                 highs=recent["high"].to_numpy(dtype=float),
                 lows=recent["low"].to_numpy(dtype=float),
                 closes=recent["close"].to_numpy(dtype=float),
                 volumes=recent["volume"].to_numpy(dtype=float),
                 db_path=BACKTEST_DB,
+                min_confluence_score=min_confluence_score,
             )
         except Exception as e:
             # Never swallow silently — a masked exception is indistinguishable
@@ -357,7 +406,8 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
             c["opposing_concurrent"] += 1
 
         oc = evaluate_outcome(
-            df_1h, pos, result["direction"], result["entry"], result["sl"], result["tp"]
+            df_exec, pos, result["direction"], result["entry"], result["sl"], result["tp"],
+            max_fill_wait=fill_wait, max_forward=forward
         )
         outcome, exit_price = oc["outcome"], oc["exit_price"]
         bars_held, bars_to_fill = oc["bars_held"], oc["bars_to_fill"]
@@ -393,7 +443,7 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
         d = by_dir[result["direction"]]
         d[outcome] += 1
         d["rr"] += realized_rr
-        notes = f"confidence={result['confidence']}"
+        notes = f"score={result['confluence_score']} confidence={result['confidence']}"
         if oc["events"]:
             notes += " | " + "; ".join(oc["events"])
         journal.log_trade(
