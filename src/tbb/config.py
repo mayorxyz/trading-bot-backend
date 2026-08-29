@@ -32,4 +32,9 @@ SIGNALS_DB = os.environ.get("SIGNALS_DB_PATH", os.path.join(DATA_DIR, "signals.d
 BACKTEST_LOG_DB = os.environ.get("BACKTEST_LOG_DB_PATH",
                                  os.path.join(DATA_DIR, "backtest_signals.db"))
 
+# SCAN path - owned by scan_store.py. API-triggered multi-symbol predict jobs
+# (POST /scan) and their per-symbol results. Deliberately its own FILE so scan
+# rows can never mix with live, analysis, or ledger data.
+SCAN_DB = os.environ.get("SCAN_DB_PATH", os.path.join(DATA_DIR, "scan_runs.db"))
+
 os.makedirs(DATA_DIR, exist_ok=True)

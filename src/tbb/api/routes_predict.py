@@ -42,35 +42,47 @@ def _predict_bars(tf: str, is_execution: bool) -> int:
     return max(bars, PREDICT_EXEC_BARS) if is_execution else bars
 
 
-def _live_frames(symbol: str, execution_tf: str) -> dict:
+def _live_frames(symbol: str, execution_tf: str) -> tuple:
     """
-    Build {timeframe: DataFrame} from LIVE Bybit candles held in memory.
+    Build ({timeframe: DataFrame} bias frames, execution DataFrame) from LIVE
+    Bybit candles held in memory.
 
-    Same data source live_runner seeds from (ingestion_bybit REST -> DataFrame,
-    via market_data's cache) and deliberately NOT data/*.csv or either database.
-    Raises HTTPException with an explicit message rather than propagating a
+    Bias frames and the execution frame are fetched INDEPENDENTLY, even when
+    execution_tf is one of PREDICT_BIAS_TFS (e.g. 1H): collapsing the two roles
+    on tf string equality would size the shared frame by execution depth and
+    feed the bias window a non-bias-depth slice, letting /predict disagree with
+    the pipeline's own bias semantics for that timeframe. Same data source
+    live_runner seeds from (ingestion_bybit REST -> DataFrame, via market_data's
+    cache) and deliberately NOT data/*.csv or either database. Raises
+    HTTPException with an explicit message rather than propagating a
     Bybit/pandas error.
     """
-    wanted = list(PREDICT_BIAS_TFS)
-    if execution_tf not in wanted:
-        wanted.append(execution_tf)
-
-    frames = {}
-    for tf in wanted:
+    for tf in PREDICT_BIAS_TFS:
         if not market_data.is_supported_timeframe(tf):
             raise HTTPException(400, f"timeframe {tf!r} cannot be fetched live from "
                                      f"Bybit; live-capable timeframes: "
                                      f"{', '.join(market_data.SUPPORTED_TIMEFRAMES)}")
-        try:
-            frames[tf] = market_data.recent_candles(
-                symbol, tf, _predict_bars(tf, tf == execution_tf))
-        except market_data.SymbolNotFound as exc:
-            raise HTTPException(404, f"no live data for {symbol} {tf}: {exc}") from exc
-        except market_data.MarketDataError as exc:
-            raise HTTPException(
+    if not market_data.is_supported_timeframe(execution_tf):
+        raise HTTPException(400, f"timeframe {execution_tf!r} cannot be fetched live "
+                                 f"from Bybit; live-capable timeframes: "
+                                 f"{', '.join(market_data.SUPPORTED_TIMEFRAMES)}")
+
+    bias_frames = {tf: _fetch_live_frame(symbol, tf, False)
+                   for tf in PREDICT_BIAS_TFS}
+    exec_df = _fetch_live_frame(symbol, execution_tf, True)
+    return bias_frames, exec_df
+
+
+def _fetch_live_frame(symbol: str, tf: str, is_execution: bool):
+    """One recent_candles call at /predict depth, with /predict's error mapping."""
+    try:
+        return market_data.recent_candles(symbol, tf, _predict_bars(tf, is_execution))
+    except market_data.SymbolNotFound as exc:
+        raise HTTPException(404, f"no live data for {symbol} {tf}: {exc}") from exc
+    except market_data.MarketDataError as exc:
+        raise HTTPException(
                 503, f"live market data unavailable for {symbol} {tf} â€” cannot "
                      f"predict without it: {exc}") from exc
-    return frames
 
 
 @router.post("/predict")
@@ -98,21 +110,20 @@ def predict(req: PredictRequest):
     symbol = _clean_symbol(req.symbol)
     timeframe = _clean_timeframe(req.timeframe) or backtest.EXECUTION_TF
 
-    frames = _live_frames(symbol, timeframe)
+    bias_frames, exec_df = _live_frames(symbol, timeframe)
 
     # "No live buffer yet" surfaces here: a freshly listed coin can be tradable
     # and still have too few bars for the structure engine to say anything.
-    exec_df = frames[timeframe]
     if len(exec_df) < backtest.LOOKBACK_BARS:
         raise HTTPException(
             422, f"not enough live history for {symbol} {timeframe}: "
                  f"{len(exec_df)} bars available, {backtest.LOOKBACK_BARS} needed. "
                  f"Bybit has no deeper history for this pair yet.")
     for tf in PREDICT_BIAS_TFS:
-        if len(frames[tf]) < PREDICT_MIN_BIAS_BARS:
+        if len(bias_frames[tf]) < PREDICT_MIN_BIAS_BARS:
             raise HTTPException(
                 422, f"not enough live {tf} history for {symbol} to resolve bias: "
-                     f"{len(frames[tf])} bars available, "
+                     f"{len(bias_frames[tf])} bars available, "
                      f"{PREDICT_MIN_BIAS_BARS} needed.")
 
     recent = exec_df.tail(backtest.LOOKBACK_BARS)
@@ -120,7 +131,6 @@ def predict(req: PredictRequest):
 
     # Exactly live_runner.run_analysis's call shape: bias from 1D/4H/1H frames,
     # entry/SL/TP from the execution timeframe's OHLCV.
-    bias_frames = {tf: frames[tf] for tf in PREDICT_BIAS_TFS}
     try:
         result = analyze_pair_with_bias(
             pair=symbol,
@@ -160,6 +170,6 @@ def predict(req: PredictRequest):
         "signal": result if fired else None,
         "bars_used": {tf: {"bars": int(len(df)),
                            "last_bar": _iso(df.index[-1]) if len(df) else None}
-                      for tf, df in frames.items()},
+                      for tf, df in {**bias_frames, timeframe: exec_df}.items()},
         "execution_bars": int(len(recent)),
     })

@@ -1,12 +1,13 @@
 # Trading Bot Backend
 
-Python backend for structural market analysis, live Bybit candle processing, historical backtests, and a read-only FastAPI surface. The repository currently has three deliberately separate data paths:
+Python backend for structural market analysis, live Bybit candle processing, historical backtests, and a read-only FastAPI surface. The repository currently has four deliberately separate data paths:
 
 - **LIVE**: `tbb/live/runner.py` computes rolling live snapshots and writes `live_state.db`; the API reads those snapshots.
 - **ANALYSIS/backtest**: `tbb/backtesting/backtest.py` replays local historical CSVs and writes analysis jobs/results to `analysis_runs.db` through the API.
 - **PREDICT**: `POST /predict` fetches live candles into memory, runs the pipeline once, and writes nothing.
+- **SCAN**: `POST /scan` runs that same predict flow in a loop over every requested symbol and appends each verdict + predict time to `data/scan_runs.db` (`scan_store.py`).
 
-All three use the same core pipeline logic where applicable, but they do not share data with one another. The live database is not an analysis archive, analysis jobs do not feed live state, and `/predict` has no storage side effect.
+All four use the same core pipeline logic where applicable, but they do not share data with one another. The live database is not an analysis archive, analysis jobs do not feed live state, and `/predict` has no storage side effect.
 
 The package is installable (`pip install -e .`) and lives under `src/tbb/`; all imports use the `tbb.*` namespace.
 
@@ -33,10 +34,10 @@ trading-bot-backend/
 │   │                     #   structure_retest, pattern_strategy, breakouts,
 │   │                     #   consolidation, entry, sl_tp, validity, confluence
 │   ├── marketdata/       # ingestion_bybit (REST), market_data (caches)
-│   ├── live/             # runner (WS live loop), trade_manager (TP1/BE/trail)
+│   ├── live/             # runner (WS live loop), scanner (multi-pair walk), trade_manager (TP1/BE/trail)
 │   ├── backtesting/      # backtest engine, profile_pipeline
-│   ├── storage/          # live_store, analysis_store, signal_store, pattern_stats
-│   └── api/              # FastAPI: app.py + common.py + routes_{live,market,analysis,predict}.py
+│   ├── storage/          # live_store, analysis_store, signal_store, scan_store, pattern_stats
+│   └── api/              # FastAPI: app.py + common.py + routes_{live,market,analysis,predict,scan}.py
 ├── tests/                # CLI verification scripts
 └── data/                 # ALL runtime artifacts - never edited by hand
     ├── *.csv             # historical candle history (backtest input / chart fallback)
@@ -45,7 +46,7 @@ trading-bot-backend/
     └── logs/             # rotating file logs
 ```
 
-`tbb/config.py` defines `DATA_DIR` and the four database locations; every consumer imports from it instead of hardcoding a path. All locations are env-overridable (`DATA_DIR`, `LIVE_DB_PATH`, `ANALYSIS_DB_PATH`, `SIGNALS_DB_PATH`, `BACKTEST_LOG_DB_PATH`), which is how tests point the stack at scratch files.
+`tbb/config.py` defines `DATA_DIR` and the five database locations; every consumer imports from it instead of hardcoding a path. All locations are env-overridable (`DATA_DIR`, `LIVE_DB_PATH`, `ANALYSIS_DB_PATH`, `SIGNALS_DB_PATH`, `BACKTEST_LOG_DB_PATH`, `SCAN_DB_PATH`), which is how tests point the stack at scratch files.
 
 ### Legacy file name map
 
@@ -87,13 +88,21 @@ POST /predict -> live in-memory candle buffer -> pipeline.py
 
 `/predict` fetches enough Bybit candles for the bias and execution timeframes, runs `analyze_pair_with_bias()` synchronously, passes `db_path=None`, and returns a signal or skip reason. It is stateless: it does not read or write `live_state.db`, `analysis_runs.db`, `signals.db`, or CSV files.
 
+### SCAN path (API-triggered)
+
+```text
+POST /scan -> per-symbol live in-memory frames -> pipeline.py -> scan_runs.db
+```
+
+`POST /scan` walks every requested symbol (default: all Bybit spot pairs quoted in the chosen quote coin) through the exact POST /predict flow, one at a time with a rate-limit pause between symbols. Each symbol's verdict - the full signal plan, a classified skip, or a per-symbol failure - plus the wall-clock predict time and the bar it was computed on is appended to `data/scan_runs.db` through `scan_store.py`. No other database or CSV is touched. One scan runs at a time (a second POST gets 409), progress counters update per symbol, and `POST /scan/stop` ends the loop cooperatively after its current symbol while keeping completed results.
+
 ## Python File Inventory
 
 Each row identifies the file's role, direct callers/importers, direct callees/dependencies, and verified storage effects. “None” means the file itself does not touch that storage type; a caller may still do so.
 
 | File | Role | Called by | Calls / depends on | Storage touched |
 |---|---|---|---|---|
-| `paths.py` | Single source of truth for the data directory and all four database locations; env-overridable, creates `data/` on import. | `live_store.py`, `analysis_store.py`, `signal_store.py`, `backtest.py`, `pipeline.py`, `tests/test_api.py`, `tests/test_live_persistence.py`. | `os`. | Creates `data/` if missing; writes nothing itself. |
+| `paths.py` | Single source of truth for the data directory and all five database locations; env-overridable, creates `data/` on import. | `live_store.py`, `analysis_store.py`, `signal_store.py`, `scan_store.py`, `backtest.py`, `pipeline.py`, `tests/test_api.py`, `tests/test_live_persistence.py`. | `os`. | Creates `data/` if missing; writes nothing itself. |
 | `analysis_store.py` | Persists queued analysis jobs, status, summaries, and completed trades. | `api.py` | `sqlite3`, `pandas`, JSON serialization, `paths.py`. | Reads/writes `data/analysis_runs.db`; no `live_state.db` or CSV. |
 | `api.py` | FastAPI HTTP surface for health, symbols, live state, charts, backtests, and prediction. | Uvicorn/HTTP clients. | `analysis_store.py`, `backtest.py`, `live_runner.py`, `live_store.py`, `market_data.py`, `phase4_risk_journal.py`, `pipeline.py`; pandas. | Reads local `data/*.csv`; reads/writes `analysis_runs.db` indirectly; reads `live_state.db` indirectly; `/predict` persists nothing. |
 | `backtest.py` | Loads historical candles, replays bars, simulates outcomes, and summarizes results. Resolutions run through `trade_manager.advance()` by default (BACKTEST_MANAGED_EXITS=0 reverts to the legacy flat SL/TP walk), so analysis numbers use the same two-step rules as live; fill/timeout horizon semantics preserved. | `api.py`, `profile_pipeline.py`; `live_runner.py` imports constants; `tests/test_live_persistence.py`. | `pipeline.py`, `phase4_risk_journal.py`, `trade_manager.py`, `paths.py`, pandas, NumPy. | Reads `data/{symbol}_{tf}.csv` history; pipeline logging writes `data/backtest_signals.db` via `paths.py`; no `live_state.db` or `analysis_runs.db` directly. |
@@ -129,6 +138,8 @@ Each row identifies the file's role, direct callers/importers, direct callees/de
 | `pipeline.py` | Shared core pipeline: bias, swings, S/R, zones, breakouts, wicks, volume, entry, SL/TP, validation, confluence (16 inputs incl. scaled fib/breakout/elliott/session scores and a low-conviction gate defaulting to 50; MSS is a weighted input only, never a veto), chart-pattern setup, retracement and BOS-retest analysis, per-bar memoization of bias/candidate/engine artifacts, bound-pruned engine evaluation (engines skipped once the weighted-sum upper bound proves the verdict; `PIPELINE_ENGINE_PRUNE=0` disables), and optional signal logging. | `api.py`, `backtest.py`, `live_runner.py`, `profile_pipeline.py`. | `zigzag.py`, `support_resistance.py`, `consolidation.py`, `breakouts.py`, `wicks.py`, `entry.py`, `sl_tp.py`, `validity.py`, `confluence.py`, `volume.py`, `signal_store.py`, `bias_bridge.py`, `pattern_detector.py`, `pattern_strategy.py`, `retracement.py`, `fibonacci.py`, `breakout_engine.py`, `elliott_wave.py`, `structure_retest.py`, `paths.py`. | Writes the caller-selected signal DB, default `data/signals.db` via `paths.py`; `db_path=None` writes nothing; no CSV. |
 | `profile_pipeline.py` | Profiles representative backtest/pipeline execution points. | CLI only. | `backtest.py`, `pipeline.py`, `cProfile`, `pstats`. | Reads historical CSVs through `backtest.py`; pipeline logging uses `backtest_signals.db`. |
 | `signal_store.py` | Creates and updates the SQLite signal ledger, including pending and closed outcomes. | `pipeline.py`; `pattern_stats.py` imports its default path. | `sqlite3`, datetime, `paths.py`. | Reads/writes `data/signals.db` via `paths.py` (absolute — the old cwd-relative default silently depended on the launch directory); not `live_state.db` or `analysis_runs.db`. |
+| `routes_scan.py` | API-triggered multi-symbol predict loop: `POST /scan` discovers symbols (scanner.get_symbols) then runs the exact /predict flow per symbol in a dedicated worker thread; status/progress/results/stop routes. | FastAPI app (`app.py`). | `analysis` none; `backtest.py` constants, `scanner.py`, `runner.py` depth constants, `market_data.py`, `pipeline.py`, `scan_store.py`, `common.py`. | Writes `data/scan_runs.db` via `scan_store.py`; no `live_state.db`, `analysis_runs.db`, `signals.db`, or CSV. |
+| `scan_store.py` | Persists scan jobs (status, progress counters) and one result row per scanned symbol: predict time, bar time, signal plan or classified skip, full signal JSON. | `routes_scan.py`. | `sqlite3`, JSON serialization, `paths.py`. | Reads/writes `data/scan_runs.db` via `paths.py`; no other database or CSV. |
 | `sl_tp.py` | Calculates stop-loss and take-profit levels from ATR, swings, S/R, and fallback R:R. | `pipeline.py`. | Caller-provided ATR, swings, and S/R; no imported project module. | None. |
 | `support_resistance.py` | Clusters swing points into S/R levels and finds nearest levels. | `pipeline.py`, `live_runner.py`; `test.py`. | NumPy; caller-provided swing data. | None. |
 | `tests/test.py` | Ad hoc synthetic check for zigzag, S/R, and entry helpers. | CLI only. | `zigzag.py`, `support_resistance.py`, `entry.py`. | None. |
@@ -142,7 +153,7 @@ Each row identifies the file's role, direct callers/importers, direct callees/de
 
 ## API Endpoints
 
-- `GET /health` - Returns API status, configured DB paths (`paths` block), runner heartbeat (`runner`: running/stale/never_run inferred from newest-tick age), `db_freshness_seconds`, live retention information, and market-data cache diagnostics.
+- `GET /health` - Returns API status, configured DB paths (`paths` block), runner heartbeat (`runner`: running/stale/never_run inferred from newest-tick age), `db_freshness_seconds`, live retention information, market-data cache diagnostics, the configured `scan_db` path, and the active scan job (`scan` block, null when idle).
 - `GET /symbols` - Lists Bybit/local symbols, chart timeframes, local timeframes, local-history flag, and last price / 24h change (fraction) from the cached ticker snapshot when available.
 - `GET /live/state` - Returns the latest live tick, timeframe state, bias, signal/skip information, the parsed `signal` object (full plan + confluence breakdown + engine blocks) when a signal fired, recent skips, and overlay freshness.
 - `GET /live/zones` - Returns current FVG/imbalance and consolidation zones, optionally filtered by timeframe.
@@ -155,6 +166,11 @@ Each row identifies the file's role, direct callers/importers, direct callees/de
 - `GET /analyze/status/{job_id}` - Returns queued/running/completed/error state, summary, funnel counts, and completed trades when available.
 - `GET /analyze/jobs` - Lists recent analysis jobs newest first.
 - `POST /predict` - Fetches live candles into memory, runs the shared pipeline synchronously, and returns a signal or skip without persistence.
+- `POST /scan` - Starts one multi-symbol predict loop (default: every Bybit spot pair quoted in `quote`, or an explicit `symbols` whitelist); returns a job ID immediately. 409 while another scan runs.
+- `GET /scan/status/{job_id}` - Returns queued/running/done/stopped/error state, live progress (`symbols_done` / `symbols_total` / `current_symbol` / fired-skipped-failed counters), and the per-symbol rows gathered so far.
+- `GET /scan/results` - The Results page feed: per-symbol predict rows from one scan (or the newest), each with `predicted_at`, `bar_ts`, the trade plan or classified skip, and the full signal object when fired; `fired=true` keeps only signals.
+- `GET /scan/jobs` - Lists recent scan jobs newest first with progress counters.
+- `POST /scan/stop` - Asks the running loop to finish after its current symbol; completed results are kept and the job is marked `stopped`.
 
 ## How To Run Locally
 
@@ -209,12 +225,13 @@ Unhandled exceptions return a bare `500 {"detail": "internal server error"}` to 
 
 ## Storage Boundaries
 
-All four databases live under `data/` (see `paths.py`); they stay separate FILES so their rows can never mix:
+All five databases live under `data/` (see `paths.py`); they stay separate FILES so their rows can never mix:
 
 - `data/live_state.db` is the rolling live hand-off owned by `live_store.py`.
 - `data/analysis_runs.db` stores queued `/analyze` jobs and backtest results owned by `analysis_store.py`.
 - `data/signals.db` is the default pipeline signal ledger owned by `signal_store.py`.
 - `data/backtest_signals.db` is used when `backtest.py` passes that path to the pipeline.
+- `data/scan_runs.db` is the API-triggered scan ledger owned by `scan_store.py`: POST /scan jobs and their per-symbol predict results.
 - `data/*.csv` is historical/local candle input for backtests and local chart fallback. `ingestion_bybit.fetch_and_save_all()` can write CSV history.
 
 Stale probe/test databases are parked in `data/archive/`, captured console output in `data/logs/`. The whole `data/` tree is gitignored — it is runtime state, not source.

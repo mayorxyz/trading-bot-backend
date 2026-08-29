@@ -17,8 +17,8 @@ from fastapi.responses import JSONResponse
 
 from tbb import config as paths, logsetup
 from tbb.marketdata import market_data
-from tbb.storage import analysis_store, live_store, signal_store
-from tbb.api import routes_analysis, routes_live, routes_market, routes_predict
+from tbb.storage import analysis_store, live_store, scan_store, signal_store
+from tbb.api import routes_analysis, routes_live, routes_market, routes_predict, routes_scan
 from tbb.api.common import DATA_DIR
 
 log = logsetup.get_logger("api")
@@ -63,6 +63,7 @@ app.include_router(routes_live.router)
 app.include_router(routes_market.router)
 app.include_router(routes_analysis.router)
 app.include_router(routes_predict.router)
+app.include_router(routes_scan.router)
 
 
 # ---------- meta ----------
@@ -82,6 +83,7 @@ def health():
             "signals_db": signal_store.DB_PATH,
             "data_dir": paths.DATA_DIR,
             "logs_dir": os.path.join(paths.DATA_DIR, "logs"),
+            "scan_db": scan_store.SCAN_DB,
         },
         # Seconds since the newest live tick was written â€” the UI's staleness
         # dot. None when the runner has never written a tick.
@@ -89,6 +91,7 @@ def health():
         "runner": heartbeat,
         "live_retention": retention,
         "market_data": market_data.cache_stats(),
+        "scan": scan_store.active_job(),
     }
 
 
