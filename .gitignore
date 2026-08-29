@@ -7,3 +7,6 @@ data/
 .env
 .vscode/
 .idea/
+
+# Virtualenv
+.venv/

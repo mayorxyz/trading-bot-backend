@@ -1,17 +1,13 @@
-# debug_check.py — paste in same folder, run: python debug_check.py
+# debug_check.py - synthetic sanity check for zigzag/S-R/entry helpers.
 import os
 import random
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from zigzag import get_zigzag_swings
-from support_resistance import find_sr_levels
-from entry import find_best_entry
-
-result = find_best_entry(c[-1], "LONG", levels)
-print("entry result:", result)
-
+from tbb.indicators.zigzag import get_zigzag_swings
+from tbb.indicators.zigzag import get_zigzag_swings
+from tbb.indicators.support_resistance import find_sr_levels
+from tbb.engines.entry import find_best_entry
 random.seed(7)
 n = 300
 h, l, c = [], [], []
@@ -30,5 +26,8 @@ print("sample swings:", swings[:5])
 levels = find_sr_levels(swings)
 print("levels found:", len(levels))
 print("sample levels:", levels[:5])
+
+result = find_best_entry(c[-1], "LONG", levels)
+print("entry result:", result)
 
 print("current price:", c[-1])

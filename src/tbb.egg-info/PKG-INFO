@@ -1,64 +1,43 @@
+Metadata-Version: 2.4
+Name: tbb
+Version: 1.0.0
+Summary: Trading bot backend: structural market analysis, live Bybit processing, backtests, read-only FastAPI surface.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi==0.141.1
+Requires-Dist: uvicorn==0.52.3
+Requires-Dist: websockets==17.0.1
+Requires-Dist: requests==2.34.2
+Requires-Dist: pandas==3.0.5
+Requires-Dist: numpy==2.5.2
+Requires-Dist: TA-Lib==0.7.1
+Requires-Dist: tzdata==2026.3
+
 # Trading Bot Backend
 
 Python backend for structural market analysis, live Bybit candle processing, historical backtests, and a read-only FastAPI surface. The repository currently has three deliberately separate data paths:
 
-- **LIVE**: `tbb/live/runner.py` computes rolling live snapshots and writes `live_state.db`; the API reads those snapshots.
-- **ANALYSIS/backtest**: `tbb/backtesting/backtest.py` replays local historical CSVs and writes analysis jobs/results to `analysis_runs.db` through the API.
-- **PREDICT**: `POST /predict` fetches live candles into memory, runs the pipeline once, and writes nothing.
+- **LIVE**: `live_runner.py` computes rolling live snapshots and writes `live_state.db`; `api.py` reads those snapshots.
+- **ANALYSIS/backtest**: `backtest.py` replays local historical CSVs and writes analysis jobs/results to `analysis_runs.db` through `api.py`.
+- **PREDICT**: `api.py` fetches live candles into memory, runs the pipeline once, and writes nothing.
 
-All three use the same core pipeline logic where applicable, but they do not share data with one another. The live database is not an analysis archive, analysis jobs do not feed live state, and `/predict` has no storage side effect.
-
-The package is installable (`pip install -e .`) and lives under `src/tbb/`; all imports use the `tbb.*` namespace.
+All three use the same core `pipeline.py` logic where applicable, but they do not share data with one another. The live database is not an analysis archive, analysis jobs do not feed live state, and `/predict` has no storage side effect.
 
 ## Repository Layout
 
 ```text
 trading-bot-backend/
-├── pyproject.toml        # package metadata; pip install -e .
-├── Dockerfile / docker-compose.yml / .env.example
-├── start_api.ps1 / start_live.ps1
-├── scripts/              # thin launchers: serve.py, run_live.py, fetch_history.py
-├── src/tbb/
-│   ├── config.py         # single source of truth for every read/write location
-│   ├── logsetup.py       # rotating file logs (data/logs/)
-│   ├── pipeline.py       # core signal pipeline (bias -> engines -> verdict)
-│   ├── bias_bridge.py    # phase1-6 -> tradable bias adapter
-│   ├── memokv.py         # per-bar memoization store
-│   ├── formatting.py     # signal table/dict formatters
-│   ├── analysis/         # market-structure phases: primitives, imbalances,
-│   │                     #   regime, risk_journal, structure_liquidity, supplementary
-│   ├── indicators/       # zigzag, support_resistance, fibonacci, wicks,
-│   │                     #   volume, pattern_detector, chart_patterns
-│   ├── engines/          # breakout_engine, elliott_wave, retracement,
-│   │                     #   structure_retest, pattern_strategy, breakouts,
-│   │                     #   consolidation, entry, sl_tp, validity, confluence
-│   ├── marketdata/       # ingestion_bybit (REST), market_data (caches)
-│   ├── live/             # runner (WS live loop), trade_manager (TP1/BE/trail)
-│   ├── backtesting/      # backtest engine, profile_pipeline
-│   ├── storage/          # live_store, analysis_store, signal_store, pattern_stats
-│   └── api/              # FastAPI: app.py + common.py + routes_{live,market,analysis,predict}.py
-├── tests/                # CLI verification scripts
-└── data/                 # ALL runtime artifacts - never edited by hand
-    ├── *.csv             # historical candle history (backtest input / chart fallback)
-    ├── *.db              # the four runtime databases below
-    ├── archive/          # stale probe/test databases kept out of the way
-    └── logs/             # rotating file logs
+├── paths.py          # single source of truth for every read/write location
+├── *.py              # production source (pipeline, engines, live, api)
+├── tests/            # CLI verification scripts
+└── data/             # ALL runtime artifacts - never edited by hand
+    ├── *.csv         # historical candle history (backtest input / chart fallback)
+    ├── *.db          # the four runtime databases below
+    ├── archive/      # stale probe/test databases kept out of the way
+    └── logs/         # captured console output
 ```
 
-`tbb/config.py` defines `DATA_DIR` and the four database locations; every consumer imports from it instead of hardcoding a path. All locations are env-overridable (`DATA_DIR`, `LIVE_DB_PATH`, `ANALYSIS_DB_PATH`, `SIGNALS_DB_PATH`, `BACKTEST_LOG_DB_PATH`), which is how tests point the stack at scratch files.
-
-### Legacy file name map
-
-The Python File Inventory below still uses pre-restructure flat names:
-
-| legacy (flat) | now |
-|---|---|
-| `paths.py` | `src/tbb/config.py` |
-| `Signal_formatter.py` | `src/tbb/formatting.py` |
-| `phase1_primitives.py` … `phase6_supplementary.py` | `src/tbb/analysis/{primitives,imbalances,regime,risk_journal,structure_liquidity,supplementary}.py` |
-| `live_runner.py` | `src/tbb/live/runner.py` |
-| `api.py` | `src/tbb/api/` (app.py + common.py + routes_*.py) |
-| everything else `*.py` | same name under `src/tbb/{indicators,engines,marketdata,live,backtesting,storage}/` per layout above |
+`paths.py` defines `DATA_DIR` and the four database locations; every consumer imports from it instead of hardcoding a path. All locations are env-overridable (`DATA_DIR`, `LIVE_DB_PATH`, `ANALYSIS_DB_PATH`, `SIGNALS_DB_PATH`, `BACKTEST_LOG_DB_PATH`), which is how tests point the stack at scratch files.
 
 ## How It Fits Together
 
@@ -163,15 +142,15 @@ Use three terminals from the backend directory. Adjust paths if the frontend liv
 **Terminal 1: API**
 
 ```powershell
-cd C:\Users\MAYOR\Desktop\trading-bot-backend
-.\start_api.ps1        # = uvicorn tbb.api.app:app --host 0.0.0.0 --port 8000
+cd C:\Users\OFFICIAL\Desktop\trading-bot-backend
+python -m uvicorn api:app --reload --port 8000
 ```
 
 **Terminal 2: live runner**
 
 ```powershell
-cd C:\Users\MAYOR\Desktop\trading-bot-backend
-.\start_live.ps1       # = python scripts\run_live.py
+cd C:\Users\OFFICIAL\Desktop\trading-bot-backend
+python live_runner.py
 ```
 
 **Terminal 3: frontend**

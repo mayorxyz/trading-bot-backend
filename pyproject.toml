@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tbb"
+version = "1.0.0"
+description = "Trading bot backend: structural market analysis, live Bybit processing, backtests, read-only FastAPI surface."
+readme = "readme.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn==0.52.3",
+    "websockets==17.0.1",
+    "requests==2.34.2",
+    "pandas==3.0.5",
+    "numpy==2.5.2",
+    "TA-Lib==0.7.1",
+    "tzdata==2026.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

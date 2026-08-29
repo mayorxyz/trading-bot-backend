@@ -1,5 +1,5 @@
 """
-test_live_persistence.py — proves live_runner PERSISTS state to live_state.db,
+test_live_persistence.py â€” proves live_runner PERSISTS state to live_state.db,
 and that it persists NOTHING ELSE.
 
 Replays historical candles as if they were arriving live: each iteration hands
@@ -10,7 +10,7 @@ Two guards on top of that:
 
 * data/ must be untouched. The live path is in-memory only; data/*.csv belongs to
   the explicit historical path (ingestion_bybit's CLI, POST /analyze). Reading
-  the CSVs to feed the replay is fine — creating or modifying one is a
+  the CSVs to feed the replay is fine â€” creating or modifying one is a
   regression, so every mtime is snapshotted and compared.
 * live_state.db must stay a short rolling buffer, so purge_old is exercised
   against a backdated tick.
@@ -23,12 +23,12 @@ import sys
 
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# (sys.path hack removed by restructure; package is pip-installed)
 
-import live_runner
-import live_store
-from backtest import load_data, slice_up_to
-import paths
+from tbb.live import runner as live_runner
+from tbb.storage import live_store
+from tbb.backtesting.backtest import load_data, slice_up_to
+from tbb import config as paths
 
 # Use a scratch DB so a real live_state.db is never clobbered by the test.
 TEST_DB = os.path.join(paths.DATA_DIR, "live_state_test.db")
@@ -41,9 +41,13 @@ H1_WINDOW = 700      # rows of 1H kept, mirroring live_runner.MAX_ROWS behaviour
 
 
 def _data_fingerprint():
-    """{path: (mtime_ns, size)} for everything in data/."""
+    """{path: (mtime_ns, size)} for everything in data/ except this test's own
+    scratch DB (the live path legitimately writes live_state.db, which TEST_DB
+    stands in for)."""
+    skip = {TEST_DB, TEST_DB + "-wal", TEST_DB + "-shm"}
     return {p: (os.stat(p).st_mtime_ns, os.stat(p).st_size)
-            for p in glob.glob(os.path.join(DATA_DIR, "*"))}
+            for p in glob.glob(os.path.join(DATA_DIR, "*"))
+            if p not in skip}
 
 
 
@@ -103,11 +107,11 @@ def main():
     print("\nrow counts:", counts)
 
     if counts["live_ticks"] == 0:
-        failures.append("live_ticks is empty — nothing was persisted")
+        failures.append("live_ticks is empty â€” nothing was persisted")
     if counts["live_tf_state"] == 0:
-        failures.append("live_tf_state is empty — bias/regime not persisted")
+        failures.append("live_tf_state is empty â€” bias/regime not persisted")
     if counts["live_levels"] == 0:
-        failures.append("live_levels is empty — S/R levels not persisted")
+        failures.append("live_levels is empty â€” S/R levels not persisted")
 
     print("\n--- sample tick ---")
     row = conn.execute("SELECT * FROM live_ticks ORDER BY id DESC LIMIT 1").fetchone()
@@ -186,7 +190,7 @@ def main():
     print(f"  after:  {after}")
 
     if purged["live_ticks"] == 0:
-        failures.append("purge_old removed no backdated ticks — buffer would grow forever")
+        failures.append("purge_old removed no backdated ticks â€” buffer would grow forever")
     if after["live_ticks"] != 1:
         failures.append(f"expected exactly 1 surviving tick (newest for BTCUSDT), "
                         f"got {after['live_ticks']}")
@@ -194,7 +198,7 @@ def main():
         failures.append(f"purge_old destroyed trade ledger rows: "
                         f"{trades_before} -> {after['live_trades']}")
     if live_store.latest_tick("BTCUSDT", db_path=TEST_DB) is None:
-        failures.append("latest_tick is None after purge — live hand-off broken")
+        failures.append("latest_tick is None after purge â€” live hand-off broken")
     orphans = 0
     conn = sqlite3.connect(TEST_DB)
     for t in ("live_tf_state", "live_zones", "live_levels"):
@@ -214,7 +218,7 @@ def main():
         for f in failures:
             print("  -", f)
         sys.exit(1)
-    print("\nPASS — live state persists to live_state.db only, and rolls over.")
+    print("\nPASS â€” live state persists to live_state.db only, and rolls over.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
-"""
-test_api.py — exercises every endpoint against a REAL running uvicorn server
+﻿"""
+test_api.py â€” exercises every endpoint against a REAL running uvicorn server
 (no TestClient, so no extra HTTP client dependency needed).
 
 Start the server first, pointing it at the scratch DBs:
@@ -13,7 +13,7 @@ Also asserts the hard requirement that ANALYSIS never touches LIVE storage: live
 row counts are snapshotted before the analyze job and compared after.
 
 The chart-data checks hit Bybit for real. With no network they report 502 from
-/ohlc (upstream unavailable) rather than 404 — that is the correct code, but it
+/ohlc (upstream unavailable) rather than 404 â€” that is the correct code, but it
 does mean this script needs connectivity to pass in full.
 """
 
@@ -25,13 +25,13 @@ import time
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# (sys.path hack removed by restructure; package is pip-installed)
 
-import paths
+from tbb import config as paths
 
 BASE = os.environ.get("API_BASE", "http://127.0.0.1:8111")
 SYMBOL = os.environ.get("API_SYMBOL", "BTCUSDT")
-# A symbol Bybit lists but we keep no local history for — chart-only path.
+# A symbol Bybit lists but we keep no local history for â€” chart-only path.
 CHART_ONLY_SYMBOL = os.environ.get("API_CHART_SYMBOL", "LINKUSDT")
 SUB_HOURLY = ("1m", "5m", "15m", "30m")
 LIVE_DB = os.environ.get("LIVE_DB_PATH", os.path.join(paths.DATA_DIR, "live_state_test.db"))
@@ -124,28 +124,28 @@ def main():
         # Local data/ holds a handful of symbols; the live list is in the hundreds.
         print(f"  {n} symbols, {n_analysis} with analysis_available")
         if n < 50:
-            print(f"  FAIL — only {n} symbols; expected the full Bybit list. "
+            print(f"  FAIL â€” only {n} symbols; expected the full Bybit list. "
                   f"warning={syms.get('warning')}")
             ok = False
         if not 0 < n_analysis <= n:
-            print(f"  FAIL — analysis_count {n_analysis} out of range")
+            print(f"  FAIL â€” analysis_count {n_analysis} out of range")
             ok = False
         missing_flag = [r["symbol"] for r in rows if "analysis_available" not in r]
         if missing_flag:
-            print(f"  FAIL — analysis_available missing on {len(missing_flag)} entries")
+            print(f"  FAIL â€” analysis_available missing on {len(missing_flag)} entries")
             ok = False
         tracked = next((r for r in rows if r["symbol"] == SYMBOL), None)
         if tracked is None or not tracked["analysis_available"]:
-            print(f"  FAIL — {SYMBOL} should be analysis_available; got {tracked}")
+            print(f"  FAIL â€” {SYMBOL} should be analysis_available; got {tracked}")
             ok = False
         else:
             print(f"  {SYMBOL}: {tracked}")
         chart_only = next((r for r in rows if r["symbol"] == CHART_ONLY_SYMBOL), None)
         if chart_only is None:
-            print(f"  FAIL — {CHART_ONLY_SYMBOL} absent from the list")
+            print(f"  FAIL â€” {CHART_ONLY_SYMBOL} absent from the list")
             ok = False
         elif chart_only["analysis_available"]:
-            print(f"  FAIL — {CHART_ONLY_SYMBOL} has no local history, "
+            print(f"  FAIL â€” {CHART_ONLY_SYMBOL} has no local history, "
                   f"analysis_available should be False")
             ok = False
         else:
@@ -167,7 +167,7 @@ def main():
             print(f"  {sym} {tf:3s} -> HTTP {st}  source={b['source']:9s} "
                   f"n={b['count']} last={last['ts']} close={last['close']}")
             if last["ts_ms"] is None:
-                print(f"  FAIL — {sym} {tf} candle has no ts_ms")
+                print(f"  FAIL â€” {sym} {tf} candle has no ts_ms")
                 ok = False
 
     print("\n" + "=" * 72)
@@ -251,7 +251,7 @@ def main():
             ok = False
 
     print("\n" + "=" * 72)
-    print("OVERLAY FRESHNESS (overlays lag live candles — must be declared)")
+    print("OVERLAY FRESHNESS (overlays lag live candles â€” must be declared)")
     print("=" * 72)
     required = {"overlay_timeframe", "computed_at", "computed_at_ms", "last_local_bar",
                 "last_local_bar_by_timeframe", "lag_seconds", "bar_seconds",
@@ -341,9 +341,9 @@ def main():
     after = live_row_counts()
     print(f"\nlive row counts AFTER analyze:  {after}")
     if before == after:
-        print("PASS — analysis did not touch live storage.")
+        print("PASS â€” analysis did not touch live storage.")
     else:
-        print("FAIL — live tables changed during an analysis run!")
+        print("FAIL â€” live tables changed during an analysis run!")
         ok = False
 
     if final and final.get("status") == "error":
