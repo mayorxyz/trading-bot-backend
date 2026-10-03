@@ -7,6 +7,8 @@ Usage: python backtest.py
 
 import os
 import math
+import sys
+import sqlite3
 
 import pandas as pd
 import numpy as np
@@ -15,6 +17,8 @@ from tbb.analysis.risk_journal import TradeJournal
 
 from tbb import config as paths
 from tbb.live import trade_manager
+from tbb.backtesting.rejection_diagnostics import (RejectionDiagnostics,
+                                                   diagnostics_enabled)
 
 SYMBOL = "BTCUSDT"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "ADAUSDT", "DOGEUSDT"]
@@ -25,6 +29,36 @@ MAX_FILL_WAIT_BARS = 24   # limit entry expires unfilled after this many bars
 LEVEL_COOLDOWN_BARS = 24  # a level is barred for this long after its trade closes
 LEVEL_BAND_PCT = 0.0025   # entries within 0.25% are treated as the same S/R zone
 MAX_CONCURRENT_POSITIONS = 3  # per symbol, and only ever on distinct S/R zones
+
+# Trading frictions (read at import; override via env for A/B).
+# Applied ONLY to accounting (realized_rr / pnl), never to signal, fill or
+# SL/TP logic. Both legs pay COST_BPS_PER_SIDE + SLIPPAGE_BPS on notional.
+COST_BPS_PER_SIDE = float(os.environ.get("COST_BPS_PER_SIDE", "10"))
+SLIPPAGE_BPS = float(os.environ.get("SLIPPAGE_BPS", "5"))
+
+
+def cost_frac_per_side():
+    """Combined fee+slippage fraction of notional paid on each leg."""
+    return (COST_BPS_PER_SIDE + SLIPPAGE_BPS) / 10000.0
+
+
+def apply_trading_costs(entry, exit_price, sl, realized_rr_gross, pnl_gross):
+    """Convert gross realized_R/pnl to net of entry+exit costs.
+
+    cost_price = entry * frac + exit * frac; pnl_net = pnl_gross - cost_price;
+    rr_net = pnl_net / |entry - sl|. Pure accounting helper — no strategy
+    input is modified.
+    """
+    try:
+        risk = abs(float(entry) - float(sl))
+    except (TypeError, ValueError):
+        risk = 0.0
+    if risk <= 0 or exit_price is None or realized_rr_gross is None or pnl_gross is None:
+        return realized_rr_gross, pnl_gross, 0.0
+    frac = cost_frac_per_side()
+    cost_price = abs(float(entry)) * frac + abs(float(exit_price)) * frac
+    pnl_net = float(pnl_gross) - cost_price
+    return pnl_net / risk, pnl_net, cost_price / risk
 
 DATA_DIR = paths.DATA_DIR
 
@@ -265,12 +299,13 @@ def classify_skip(reason):
 def _blank_counters():
     return {"insufficient_htf": 0, "position_open": 0, "cooldown": 0, "no_fill": 0,
             "timeouts": 0, "trades": 0, "test_points": 0, "zone_occupied": 0,
-            "opposing_concurrent": 0, "skips": {}, "errors": {}}
+            "opposing_concurrent": 0, "rr_gross": 0.0, "rr_net": 0.0,
+            "cost_r": 0.0, "skips": {}, "errors": {}}
 
 
 def _blank_dirs():
-    return {"LONG": {"win": 0, "loss": 0, "rr": 0.0},
-            "SHORT": {"win": 0, "loss": 0, "rr": 0.0}}
+    return {"LONG": {"win": 0, "loss": 0, "rr": 0.0, "rr_gross": 0.0},
+            "SHORT": {"win": 0, "loss": 0, "rr": 0.0, "rr_gross": 0.0}}
 
 
 def _align_tz(ts, index):
@@ -282,9 +317,206 @@ def _align_tz(ts, index):
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert(tz)
 
 
+def _get_candidate_outcome_metrics(df_exec, pos, direction, entry, sl, tp, fill_wait, horizon):
+    """
+    Calculate MFE_R, MAE_R and first-touch R-attainment flags for a window.
+    Pessimistic: if SL (-1R) and a target are hit in same bar, it's a loss.
+    Outcomes only count if the entry is touched within fill_wait bars after pos.
+    MFE/MAE measured from the fill bar onward; accumulation stops at SL.
+    """
+    if not entry or not sl or entry == sl:
+        return {"filled": 0, "mfe_r": None, "mae_r": None, "r1": None, "r15": None, "r2": None}
+    
+    highs = df_exec["high"].values
+    lows = df_exec["low"].values
+    n = len(df_exec)
+    
+    fill_i = None
+    # Entry can happen from pos+1 onwards
+    fill_end = min(pos + 1 + fill_wait, n)
+    for i in range(pos + 1, fill_end):
+        if direction == "LONG" and lows[i] <= entry:
+            fill_i = i
+            break
+        if direction == "SHORT" and highs[i] >= entry:
+            fill_i = i
+            break
+            
+    if fill_i is None:
+        return {"filled": 0, "mfe_r": None, "mae_r": None, "r1": None, "r15": None, "r2": None}
+
+    # Outcome from fill_i
+    r_val = abs(entry - sl)
+    end = min(fill_i + horizon, n)
+    mfe = 0.0
+    mae = 0.0
+    r1 = r15 = r2 = 0
+    hit_neg1 = False
+    
+    for i in range(fill_i, end):
+        h, l = highs[i], lows[i]
+        
+        if direction == "LONG":
+            # Pessimistic: check SL first
+            if l <= sl:
+                mae = max(mae, entry - sl)
+                hit_neg1 = True
+            else:
+                mfe = max(mfe, h - entry)
+                mae = max(mae, entry - l)
+                if h >= entry + 2 * r_val: r1 = r15 = r2 = 1
+                elif h >= entry + 1.5 * r_val: r1 = r15 = 1
+                elif h >= entry + r_val: r1 = 1
+        else: # SHORT
+            if h >= sl:
+                mae = max(mae, sl - entry)
+                hit_neg1 = True
+            else:
+                mfe = max(mfe, entry - l)
+                mae = max(mae, h - entry)
+                if l <= entry - 2 * r_val: r1 = r15 = r2 = 1
+                elif l <= entry - 1.5 * r_val: r1 = r15 = 1
+                elif l <= entry - r_val: r1 = 1
+        
+        if hit_neg1:
+            break
+            
+    return {
+        "filled": 1, "mfe_r": mfe / r_val, "mae_r": mae / r_val,
+        "r1": r1, "r15": r15, "r2": r2
+    }
+
+
+def _log_candidate_outcome(symbol, ts, result, df_1d, df_4h, df_exec, pos, execution_tf):
+    """
+    Additive logger for every point that reached calculate_confluence.
+    Gated by CANDIDATE_LOG=1.
+    """
+    if "confluence_breakdown" not in result:
+        return
+
+    # Common historical slicing up to decision bar ts / pos
+    hist_1d = df_1d[df_1d.index <= ts]
+    hist_4h = df_4h[df_4h.index <= ts]
+    hist_exec = df_exec.iloc[:pos + 1]
+
+    from tbb.bias_bridge import resolve_bias
+    bias = resolve_bias({"1D": hist_1d, "4H": hist_4h, "1H": hist_exec})
+    htf_aligned = bias.get("topdown", {}).get("aligned_count")
+
+    timestamp_ts = pd.Timestamp(ts)
+    hour_utc = int(timestamp_ts.hour)
+    dow = int(timestamp_ts.dayofweek)
+
+    close_close = float(hist_exec["close"].iloc[-1])
+    import talib
+    atr_arr = talib.ATR(
+        hist_exec["high"].to_numpy(dtype=float),
+        hist_exec["low"].to_numpy(dtype=float),
+        hist_exec["close"].to_numpy(dtype=float),
+        timeperiod=14
+    )
+    atr_pct = float(atr_arr[-1] / close_close * 100) if len(atr_arr) and not np.isnan(atr_arr[-1]) else None
+
+    # 1. Recover entry/sl/tp/direction/touches if it was a skip (low conviction)
+    if "skipped" not in result:
+        direction = result["direction"]
+        entry = result["entry"]
+        sl = result["sl"]
+        tp = result["tp"]
+        score = result["confluence_score"]
+        skip_reason = None
+        touches = result.get("entry_level_touches")
+    else:
+        from tbb.pipeline import _prepare_candidate
+        direction = bias.get("direction")
+        if not direction:
+            return
+        d = str(direction).upper()
+        direction = {"BULLISH": "LONG", "LONG": "LONG", "BUY": "LONG",
+                     "BEARISH": "SHORT", "SHORT": "SHORT", "SELL": "SHORT"}.get(d)
+        if direction is None:
+            return
+        recent = hist_exec.tail(LOOKBACK_BARS)
+        prep = _prepare_candidate(
+            recent["open"].to_numpy(dtype=float),
+            recent["high"].to_numpy(dtype=float),
+            recent["low"].to_numpy(dtype=float),
+            recent["close"].to_numpy(dtype=float),
+            recent["volume"].to_numpy(dtype=float),
+            direction
+        )
+        if "trade" not in prep:
+            return
+        entry = prep["trade"]["entry"]
+        sl = prep["trade"]["sl"]["sl_price"]
+        tp = prep["trade"]["tp"]["tp_price"]
+        score = round(sum(result["confluence_breakdown"].values()))
+        skip_reason = result["skipped"]
+        touches = prep.get("level_touches")
+
+    entry_dist_pct = float(abs(entry - close_close) / close_close * 100) if close_close else None
+    sl_dist_pct = float(abs(entry - sl) / entry * 100) if entry else None
+
+    # 2. Outcomes for 24h and 100h horizons
+    tf_min = _TF_MINUTES.get(execution_tf.upper(), 60)
+    scale = 60.0 / tf_min
+    fill_wait = int(24 * scale)
+    res_24 = _get_candidate_outcome_metrics(df_exec, pos, direction, entry, sl, tp, fill_wait, int(24 * scale))
+    res_100 = _get_candidate_outcome_metrics(df_exec, pos, direction, entry, sl, tp, fill_wait, int(100 * scale))
+    
+    filled = res_24["filled"]
+
+    # 3. SQLite write
+    db_path = os.path.join(DATA_DIR, "candidate_outcomes.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        comp_keys = [
+            "pattern_match", "trend_align", "mtf_alignment", "sr_level_strength",
+            "wick_rejection", "fib_score", "volume_confirm", "structure_bos_align",
+            "liquidity_target", "no_mss_conflict", "chart_pattern_align",
+            "retracement_confirm", "breakout_score", "elliott_score",
+            "structure_retest_confirm", "session_timing"
+        ]
+
+        # Ensure table exists with all columns in exact order
+        cols = ["symbol TEXT", "timestamp TEXT", "direction TEXT", "entry REAL",
+                "stop REAL", "tp REAL", "confluence_score REAL"]
+        cols += [f"{k} REAL" for k in comp_keys]
+        cols += [
+            "skip_reason TEXT", "filled INTEGER",
+            "entry_dist_pct REAL", "sl_dist_pct REAL", "atr_pct REAL",
+            "touches INTEGER", "htf_aligned INTEGER", "hour_utc INTEGER", "dow INTEGER",
+            "mfe_24 REAL", "mae_24 REAL", "r1_24 INTEGER", "r15_24 INTEGER", "r2_24 INTEGER",
+            "mfe_100 REAL", "mae_100 REAL", "r1_100 INTEGER", "r15_100 INTEGER", "r2_100 INTEGER"
+        ]
+        conn.execute(f"CREATE TABLE IF NOT EXISTS candidate_outcomes ({', '.join(cols)})")
+
+        # Prepare values matching cols order
+        row = [symbol, str(ts), direction, entry, sl, tp, score]
+        bd = result["confluence_breakdown"]
+        row += [bd.get(k, 0.0) for k in comp_keys]
+        row.append(skip_reason)
+        row.append(filled)
+        row += [entry_dist_pct, sl_dist_pct, atr_pct, touches, htf_aligned, hour_utc, dow]
+        
+        for res in [res_24, res_100]:
+            if filled:
+                row += [res["mfe_r"], res["mae_r"], res["r1"], res["r15"], res["r2"]]
+            else:
+                row += [None] * 5
+
+        placeholders = ",".join(["?"] * len(row))
+        conn.execute(f"INSERT INTO candidate_outcomes VALUES ({placeholders})", row)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Candidate logging error: {e}", file=sys.stderr)
+
+
 def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
                start_date=None, end_date=None, execution_tf="1H",
-               min_confluence_score=50):
+               min_confluence_score=50, diag=None):
     """
     Backtest one symbol into a shared journal.
 
@@ -341,7 +573,11 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
     points = range(lo, hi, step) if hi > lo else range(0)
     c["test_points"] = len(points)
 
+    eval_count = 0
     for pos in points:
+        eval_count += 1
+        if eval_count % 100 == 0:
+            print(f"{symbol} bar {pos}/{n} trades={c['trades']} skips_size={len(c['skips'])}", file=sys.stderr, flush=True)
         ts = df_exec.index[pos]
 
         hist_1d = slice_up_to(df_1d, ts)
@@ -354,6 +590,11 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
         if len(hist_1d) < 10 or len(hist_4h) < 10 or len(hist_exec) < LOOKBACK_BARS:
             c["insufficient_htf"] += 1
             continue
+
+        # Additive diagnostics: resolve this bar's bias direction once and record
+        # the baseline direction-quality row. Read-only; does not gate anything.
+        if diag is not None:
+            diag.begin_point(pos, hist_1d, hist_4h, hist_exec, df_exec)
 
         # Retire anything that has closed by this bar, then refuse only if every
         # slot is still occupied. Checked before analysis to skip pipeline cost.
@@ -376,6 +617,14 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
                 db_path=BACKTEST_DB,
                 min_confluence_score=min_confluence_score,
             )
+            if diag is not None and "skipped" not in result:
+                diag.record_entry_result(result, pos)
+            # Candidate-outcome logger (additive, gated)
+            if os.environ.get("CANDIDATE_LOG") == "1":
+                try:
+                    _log_candidate_outcome(symbol, ts, result, df_1d, df_4h, df_exec, pos, execution_tf)
+                except Exception as _e:
+                    print(f"[candidate-log] {symbol} {ts} {type(_e).__name__}: {_e}", file=sys.stderr, flush=True)
         except Exception as e:
             # Never swallow silently â€” a masked exception is indistinguishable
             # from "no signal found", which is what hid the real bug before.
@@ -388,15 +637,31 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
         if "skipped" in result:
             key = classify_skip(result["skipped"])
             c["skips"][key] = c["skips"].get(key, 0) + 1
+            # Additive diagnostics only — records why the point was rejected.
+            # The funnel counters above are untouched, so totals stay identical.
+            # The context bundle is read-only references the S/R replica needs;
+            # it is ignored by any other rejection bucket.
+            if diag is not None:
+                diag.record_skip(key, result, pos, context={
+                    "recent": recent,
+                    "hist_1d": hist_1d,
+                    "hist_4h": hist_4h,
+                    "hist_exec": hist_exec,
+                    "pos": pos,
+                })
             continue
 
         lk = level_key(result["entry"])
         # Distinct zones only: never stack a second position on a level already held.
         if lk in open_positions:
             c["zone_occupied"] += 1
+            if diag is not None:
+                diag.record_candidate("zone_occupied", pos, result["direction"])
             continue
         if pos < level_blocked_until.get(lk, -1):
             c["cooldown"] += 1
+            if diag is not None:
+                diag.record_candidate("cooldown", pos, result["direction"])
             continue
 
         # Diagnostic only, not a gate: how often we end up holding offsetting
@@ -413,6 +678,8 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
         bars_held, bars_to_fill = oc["bars_held"], oc["bars_to_fill"]
         if outcome == "no_fill":
             c["no_fill"] += 1
+            if diag is not None:
+                diag.record_candidate("no_fill", pos, result["direction"])
             # A working order still occupies its slot until it expires, and the
             # zone is cooled down so an unreachable level is not retried on
             # every subsequent test point.
@@ -428,7 +695,13 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
 
         if outcome == "timeout":
             c["timeouts"] += 1
+            if diag is not None:
+                diag.record_candidate("timeout", pos, result["direction"])
             continue
+
+        # Filled and resolved (win/loss): the "accepted" direction-quality row.
+        if diag is not None:
+            diag.record_candidate("filled", pos, result["direction"])
 
         pnl = (exit_price - result["entry"]) if result["direction"] == "LONG" else (result["entry"] - exit_price)
         realized_rr = pnl / abs(result["entry"] - result["sl"]) if result["entry"] != result["sl"] else 0
@@ -438,11 +711,25 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
             realized_rr = oc["realized_rr"]
             pnl = oc["pnl"]
 
+        # Trading frictions: accounting only (entry/exit levels, fill, SL/TP
+        # untouched). realized_rr/pnl stored below are NET; gross kept for
+        # before/after-cost reporting in c["rr_gross"]/by_dir gross buckets.
+        realized_rr_gross = realized_rr
+        realized_rr, pnl, cost_r = apply_trading_costs(
+            result["entry"], exit_price, result["sl"], realized_rr_gross, pnl)
+        # Costs can flip a marginal gross win into a net loss (and vice versa
+        # never happens since costs are strictly >= 0): outcome follows NET.
+        outcome = "win" if realized_rr > 0 else "loss"
+
         trade_id += 1
         c["trades"] += 1
+        c["rr_gross"] += realized_rr_gross
+        c["rr_net"] += realized_rr
+        c["cost_r"] += cost_r
         d = by_dir[result["direction"]]
         d[outcome] += 1
         d["rr"] += realized_rr
+        d["rr_gross"] += realized_rr_gross
         notes = f"score={result['confluence_score']} confidence={result['confidence']}"
         if oc["events"]:
             notes += " | " + "; ".join(oc["events"])
@@ -464,7 +751,7 @@ def run_symbol(symbol, journal, step=4, trade_id_start=0, verbose=True,
 def _merge(into, c):
     for k in ("insufficient_htf", "position_open", "cooldown", "no_fill",
               "timeouts", "trades", "test_points", "zone_occupied",
-              "opposing_concurrent"):
+              "opposing_concurrent", "rr_gross", "rr_net", "cost_r"):
         into[k] += c[k]
     for bucket in ("skips", "errors"):
         for k, v in c[bucket].items():
@@ -491,6 +778,11 @@ def print_report(label, c, by_dir, stats, rr_pf=None):
     print(stats)
     if rr_pf is not None:
         print(f"profit_factor_R (scale-free): {rr_pf:.3f}")
+    t = c["trades"]
+    if t:
+        print(f"avg_rr gross (before costs): {c['rr_gross'] / t:+.3f}  "
+              f"net (after {COST_BPS_PER_SIDE:.0f}bps/side+{SLIPPAGE_BPS:.0f}bps slip): "
+              f"{c['rr_net'] / t:+.3f}  avg_cost: {c['cost_r'] / t:+.3f}R")
 
     print(f"\n--- funnel ({c['test_points']} test points) ---")
     print(f"{c['insufficient_htf']:5d}  insufficient HTF history (HTF CSV starts after 1H CSV)")
@@ -517,7 +809,8 @@ def print_report(label, c, by_dir, stats, rr_pf=None):
         t = s["win"] + s["loss"]
         if t:
             print(f"{name:5s} trades={t:4d}  wins={s['win']:4d}  "
-                  f"win_rate={s['win'] / t:.3f}  avg_rr={s['rr'] / t:+.3f}")
+                  f"win_rate={s['win'] / t:.3f}  avg_rr_net={s['rr'] / t:+.3f}  "
+                  f"avg_rr_gross={s.get('rr_gross', s['rr']) / t:+.3f}")
 
 
 def run_multi(symbols=SYMBOLS, step=4, verbose=False):
@@ -527,16 +820,23 @@ def run_multi(symbols=SYMBOLS, step=4, verbose=False):
     all_dir = _blank_dirs()
     trade_id = 0
     done = []
+    diags = []
+    extra_diag = diagnostics_enabled()
 
     for sym in symbols:
+        sym_diag = (RejectionDiagnostics(sym, EXECUTION_TF)
+                    if extra_diag else None)
         try:
-            c, by_dir, trade_id = run_symbol(sym, journal, step, trade_id, verbose)
+            c, by_dir, trade_id = run_symbol(sym, journal, step, trade_id, verbose,
+                                             diag=sym_diag)
         except FileNotFoundError as e:
             print(f"{sym:10s} SKIPPED - missing data: {e}")
             continue
+        if sym_diag is not None:
+            diags.append((sym, sym_diag))
         _merge(total, c)
         for side in all_dir:
-            for f in ("win", "loss", "rr"):
+            for f in ("win", "loss", "rr", "rr_gross"):
                 all_dir[side][f] += by_dir[side][f]
         done.append(sym)
         print(f"{sym:10s} points={c['test_points']:5d}  trades={c['trades']:4d}  "
@@ -559,6 +859,9 @@ def run_multi(symbols=SYMBOLS, step=4, verbose=False):
     print_report(f"COMBINED - {len(done)} symbols", total, all_dir,
                  journal.summary_stats(),
                  rr_pf=rr_profit_factor(closed_all) if not closed_all.empty else None)
+    # Additive rejection diagnostics, printed per symbol directly under the funnel.
+    for _sym, _diag in diags:
+        _diag.print_report()
     print("\nNOTE: summary_stats() net_pnl/profit_factor are price-delta based and are")
     print("      NOT cross-symbol comparable. Use win_rate, avg_rr and profit_factor_R.")
     return journal, journal.summary_stats()
@@ -567,12 +870,15 @@ def run_multi(symbols=SYMBOLS, step=4, verbose=False):
 def run_backtest(step=4, symbol=SYMBOL):
     """Single-symbol backtest (original behaviour)."""
     journal = TradeJournal()
-    c, by_dir, _ = run_symbol(symbol, journal, step, 0, verbose=True)
+    diag = RejectionDiagnostics(symbol, EXECUTION_TF) if diagnostics_enabled() else None
+    c, by_dir, _ = run_symbol(symbol, journal, step, 0, verbose=True, diag=diag)
     stats = journal.summary_stats()
     df = journal.to_dataframe()
     closed = df[df["outcome"].isin(["win", "loss"])]
     print_report(f"BACKTEST SUMMARY - {symbol}", c, by_dir, stats,
                  rr_pf=rr_profit_factor(closed) if not closed.empty else None)
+    if diag is not None:
+        diag.print_report()
     return journal, stats
 
 

@@ -1,4 +1,4 @@
-"""Live bybit signal runner for BTCUSDT â€” 1D/4H/1H/15M data, predicts on 1H and 15M close.
+"""Live Bybit signal runner for a caller-supplied symbol or watchlist.
 
 NOTHING IN THIS PROCESS TOUCHES THE DISK except live_state.db. Seed history is
 fetched straight into in-memory DataFrames and WS bars are appended in memory;
@@ -15,8 +15,10 @@ the pipeline call is the same one as before; state collection reads the same
 inputs a second time and stores what it finds.
 """
 
+import argparse
 import asyncio
 import json
+import os
 import sys
 import traceback
 
@@ -39,13 +41,29 @@ from tbb.analysis.regime import detect_regime, resolve_topdown_bias
 from tbb.indicators.support_resistance import find_sr_levels
 from tbb.indicators.zigzag import get_zigzag_swings
 
-SYMBOL = "BTCUSDT"
 STREAM_URL = "wss://stream.bybit.com/v5/public/spot"
 
-# Bybit kline stream interval codes, keyed by our timeframe label. Built from
-# SYMBOL so changing SYMBOL cannot leave the topics pointing at another pair.
+# Bybit kline stream interval codes, keyed by our timeframe label. Built from a
+# runtime symbol so the subscription topic always matches the running pair.
 TF_STREAM_CODE = {"1D": "D", "4H": "240", "1H": "60", "15M": "15"}
-TF_TOPIC = {tf: f"kline.{code}.{SYMBOL}" for tf, code in TF_STREAM_CODE.items()}
+
+
+def _symbol_list(spec):
+    """Normalise a caller-supplied symbol or comma-separated watchlist."""
+    if spec is None:
+        return []
+    if isinstance(spec, str):
+        values = [part.strip() for part in spec.split(",")]
+    else:
+        values = [str(part).strip() for part in spec]
+    symbols = [value.upper() for value in values if value]
+    if not symbols:
+        raise ValueError("no symbols supplied")
+    return symbols
+
+
+def _tf_topic_map(symbol):
+    return {tf: f"kline.{code}.{symbol}" for tf, code in TF_STREAM_CODE.items()}
 
 TRIGGER_TFS = {"1H", "15M"}  # analysis runs on close of these TFs
 MAX_ROWS = 2000
@@ -86,7 +104,7 @@ def _normalise(df):
     return df
 
 
-def seed_history(symbol=SYMBOL):
+def seed_history(symbol):
     """
     Seed each timeframe from Bybit REST into memory. No CSV is written or read.
 
@@ -95,8 +113,10 @@ def seed_history(symbol=SYMBOL):
     A per-timeframe failure degrades to an empty frame rather than killing the
     run; the pipeline already guards on insufficient history.
     """
+    symbol = str(symbol).upper()
+    topics = _tf_topic_map(symbol)
     df_by_tf = {}
-    for tf in TF_TOPIC:
+    for tf in topics:
         try:
             df = fetch_klines(symbol, tf, days_back=SEED_DAYS[tf])
         except Exception as exc:
@@ -295,8 +315,9 @@ def resolve_open_live_trades(symbol, df_by_tf):
     return changed
 
 
-def run_analysis(df_by_tf, execution_tf, symbol=SYMBOL):
+def run_analysis(df_by_tf, execution_tf, symbol):
     """Run pipeline using 1D/4H/1H for bias, execution_tf's data for entry/SL-TP."""
+    symbol = str(symbol).upper()
     recent = df_by_tf[execution_tf].tail(200)
     opens = recent["open"].to_numpy(dtype=float)
     highs = recent["high"].to_numpy(dtype=float)
@@ -353,14 +374,15 @@ def run_analysis(df_by_tf, execution_tf, symbol=SYMBOL):
     return result
 
 
-async def run_live_stream(df_by_tf):
-    topic_to_tf = {v: k for k, v in TF_TOPIC.items()}
+async def run_live_stream(df_by_tf, symbol):
+    topic_map = _tf_topic_map(symbol)
+    topic_to_tf = {v: k for k, v in topic_map.items()}
     while True:
         try:
             async with websockets.connect(
                 STREAM_URL, ping_interval=20, ping_timeout=10
             ) as ws:
-                subscribe_msg = {"op": "subscribe", "args": list(TF_TOPIC.values())}
+                subscribe_msg = {"op": "subscribe", "args": list(topic_map.values())}
                 await ws.send(json.dumps(subscribe_msg))
                 async for raw in ws:
                     data = json.loads(raw)
@@ -377,7 +399,7 @@ async def run_live_stream(df_by_tf):
 
                         if tf in TRIGGER_TFS:
                             try:
-                                run_analysis(df_by_tf, execution_tf=tf)
+                                run_analysis(df_by_tf, execution_tf=tf, symbol=symbol)
                             except Exception:
                                 log = logsetup.get_logger("live_runner")
                                 log.exception("analysis cycle failed; live loop continues")
@@ -387,21 +409,44 @@ async def run_live_stream(df_by_tf):
             await asyncio.sleep(5)
 
 
-def main():
+def _cli_symbols(argv=None):
+    parser = argparse.ArgumentParser(description="Run the live Bybit runner for one symbol or watchlist.")
+    parser.add_argument("--symbol", dest="symbol", help="single symbol to track, e.g. BTCUSDT")
+    parser.add_argument("--symbols", dest="symbols", help="comma-separated symbols, e.g. BTCUSDT,ETHUSDT")
+    args = parser.parse_args(argv)
+
+    explicit = _symbol_list(args.symbols) if args.symbols else []
+    if args.symbol:
+        explicit.extend(_symbol_list(args.symbol))
+    if not explicit:
+        env_symbol = os.environ.get("TBB_SYMBOL") or os.environ.get("LIVE_SYMBOL")
+        if env_symbol:
+            explicit.extend(_symbol_list(env_symbol))
+    if not explicit:
+        parser.error("a symbol or --symbols list is required; no default BTCUSDT fallback is used")
+    return explicit
+
+
+def main(argv=None):
     # Signal alerts contain emoji; a cp1252 console would raise mid-print and,
     # in the scanner, kill that symbol's persistence with it.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+    symbols = _cli_symbols(argv)
     log = logsetup.get_logger("live_runner")
     print(f"live_runner: seed + stream are IN MEMORY ONLY (no data/*.csv writes). "
-          f"live_state.db retention = {live_store.LIVE_RETENTION_HOURS}h.")
-    # Trim on startup too: the first tick can be up to one execution bar away.
-    print(f"[startup] purge_old -> {live_store.purge_old()}")
-    df_by_tf = seed_history()
-    log.info("seeded, streaming started (retention=%sh)", live_store.LIVE_RETENTION_HOURS)
-    asyncio.run(run_live_stream(df_by_tf))
+          f"live_state.db retention = {live_store.LIVE_RETENTION_HOURS}h. "
+          f"symbols={', '.join(symbols)}")
+    for idx, symbol in enumerate(symbols, 1):
+        if len(symbols) > 1:
+            print(f"[startup] starting watchlist symbol {idx}/{len(symbols)}: {symbol}")
+        # Trim on startup too: the first tick can be up to one execution bar away.
+        print(f"[startup] purge_old -> {live_store.purge_old()}")
+        df_by_tf = seed_history(symbol)
+        log.info("seeded %s, streaming started (retention=%sh)", symbol, live_store.LIVE_RETENTION_HOURS)
+        asyncio.run(run_live_stream(df_by_tf, symbol))
 
 
 if __name__ == "__main__":

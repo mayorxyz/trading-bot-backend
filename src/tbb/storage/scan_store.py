@@ -26,8 +26,9 @@ SCAN_DB = paths.SCAN_DB
 # Job lifecycle. RUNNING covers "loop in progress"; STOPPED means the operator
 # (POST /scan/stop) asked the loop to finish early - completed symbols stay,
 # unprocessed ones are simply gone.
-QUEUED, RUNNING, DONE, ERROR, STOPPED = (
-    "queued", "running", "done", "error", "stopped")
+QUEUED, RUNNING, PAUSED, DONE, ERROR, STOPPED = (
+    "queued", "running", "paused", "done", "error", "stopped")
+
 
 
 def _resolve(db_path):
@@ -53,6 +54,17 @@ def _to_ms(iso_str):
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return int(ts.timestamp() * 1000)
+
+
+def _ensure_scan_result_columns(conn):
+    """Additive upgrade for pre-existing scan_runs.db files: add nullable
+    logging columns without touching existing data. CREATE TABLE IF NOT
+    EXISTS above covers fresh DBs; ALTER covers old ones."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scan_results)").fetchall()}
+    if "confluence_breakdown_json" not in cols:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN confluence_breakdown_json TEXT")
+    if "skip_score" not in cols:
+        conn.execute("ALTER TABLE scan_results ADD COLUMN skip_score REAL")
 
 
 def init_db(db_path=None):
@@ -95,11 +107,14 @@ def init_db(db_path=None):
             confidence       TEXT,
             signal_json      TEXT,
             error            TEXT,
+            confluence_breakdown_json TEXT,
+            skip_score       REAL,
             UNIQUE(job_id, symbol)
         );
         CREATE INDEX IF NOT EXISTS ix_scan_results_job
             ON scan_results(job_id, signal_fired);
     """)
+    _ensure_scan_result_columns(conn)
     conn.commit()
     conn.close()
 
@@ -130,6 +145,22 @@ def mark_running(job_id, symbols_total=None, db_path=None):
     else:
         conn.execute("UPDATE scan_jobs SET status=?, started_at=? WHERE job_id=?",
                      (RUNNING, _now(), job_id))
+    conn.commit()
+    conn.close()
+
+
+def mark_paused(job_id, db_path=None):
+    conn = _connect(db_path)
+    conn.execute("UPDATE scan_jobs SET status=? WHERE job_id=?",
+                 (PAUSED, job_id))
+    conn.commit()
+    conn.close()
+
+
+def mark_resumed(job_id, db_path=None):
+    conn = _connect(db_path)
+    conn.execute("UPDATE scan_jobs SET status=? WHERE job_id=?",
+                 (RUNNING, job_id))
     conn.commit()
     conn.close()
 
@@ -183,7 +214,8 @@ def add_result(job_id, row, db_path=None):
     """
     Persist one per-symbol predict result. `row` keys: symbol, timeframe,
     predicted_at, bar_ts, signal_fired, skip_reason, skip_reason_raw, direction,
-    entry, sl, tp, rr, confluence_score, confidence, signal, error.
+    entry, sl, tp, rr, confluence_score, confidence, signal, error,
+    confluence_breakdown_json, skip_score (last two: skip-only logging, None otherwise).
     REPLACE keeps re-running the same job_id idempotent (UNIQUE job_id+symbol).
     """
     init_db(db_path)
@@ -192,15 +224,17 @@ def add_result(job_id, row, db_path=None):
         INSERT OR REPLACE INTO scan_results
         (job_id, symbol, timeframe, predicted_at, bar_ts, signal_fired,
          skip_reason, skip_reason_raw, direction, entry, sl, tp, rr,
-         confluence_score, confidence, signal_json, error)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         confluence_score, confidence, signal_json, error,
+         confluence_breakdown_json, skip_score)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (job_id, row.get("symbol"), row.get("timeframe"), row.get("predicted_at"),
           row.get("bar_ts"), 1 if row.get("signal_fired") else 0,
           row.get("skip_reason"), row.get("skip_reason_raw"), row.get("direction"),
           row.get("entry"), row.get("sl"), row.get("tp"), row.get("rr"),
           row.get("confluence_score"), row.get("confidence"),
           json.dumps(row["signal"], default=str) if row.get("signal") else None,
-          row.get("error")))
+          row.get("error"), row.get("confluence_breakdown_json"),
+          row.get("skip_score")))
     conn.commit()
     conn.close()
 

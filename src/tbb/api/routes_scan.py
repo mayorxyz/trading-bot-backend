@@ -14,6 +14,7 @@ scan_runs.db (scan_store.py): live_state.db, analysis_runs.db, signals.db and
 CSV history are never touched.
 """
 
+import json
 import re
 import threading
 import time
@@ -45,6 +46,23 @@ router = APIRouter()
 _SCAN_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scan")
 _SCAN_LOCK = threading.Lock()
 _STOP_EVENTS = {}   # job_id -> threading.Event, checked between symbols
+_PAUSE_EVENTS = {}  # job_id -> threading.Event
+
+@router.post("/scan/pause")
+def scan_pause():
+    for jid, event in list(_STOP_EVENTS.items()):
+        if not event.is_set():
+            _PAUSE_EVENTS.setdefault(jid, threading.Event()).set()
+            return {"paused": jid, "status": "paused"}
+    return {"paused": None, "note": "no scan is running"}
+
+@router.post("/scan/resume")
+def scan_resume():
+    for jid, event in list(_PAUSE_EVENTS.items()):
+        if event.is_set():
+            event.clear()
+            return {"resumed": jid, "status": "running"}
+    return {"resumed": None, "note": "scan is not paused"}
 
 # Same rate-limit courtesy between symbols as tbb/live/scanner.py.
 SYMBOL_PAUSE_SECONDS = 0.5
@@ -87,6 +105,7 @@ def _scan_symbol(symbol: str, timeframe: str) -> dict:
         "signal_fired": False, "skip_reason": None, "skip_reason_raw": None,
         "direction": None, "entry": None, "sl": None, "tp": None, "rr": None,
         "confluence_score": None, "confidence": None, "signal": None, "error": None,
+        "confluence_breakdown_json": None, "skip_score": None,
     }
 
     # Fetch bias frames and the execution frame INDEPENDENTLY. When the
@@ -149,6 +168,17 @@ def _scan_symbol(symbol: str, timeframe: str) -> dict:
         # Same classified categories the live funnel and /predict use.
         row["skip_reason"] = backtest.classify_skip(skipped)
         row["skip_reason_raw"] = skipped
+        # Logging only: keep the confluence breakdown/score for low-conviction
+        # skips. Other skip kinds (bias/entry/invalid-trade) have no breakdown
+        # and keep NULL for both. Fired-signal path below is untouched.
+        breakdown = result.get("confluence_breakdown") if isinstance(result, dict) else None
+        if isinstance(breakdown, dict) and breakdown:
+            score = result.get("confluence_score")
+            if not isinstance(score, (int, float)):
+                m = re.search(r"confluence (\d+)/100", skipped or "")
+                score = int(m.group(1)) if m else None
+            row["skip_score"] = score
+            row["confluence_breakdown_json"] = json.dumps(breakdown, default=str)
         return row
 
     row.update({
@@ -174,41 +204,58 @@ def _run_scan_job(job_id, symbols, timeframe, quote):
     try:
         scan_store.mark_running(job_id, symbols_total=len(symbols))
         done = fired = skipped = failed = 0
+
         for n, symbol in enumerate(symbols, 1):
-            event = _STOP_EVENTS.get(job_id)
-            if event is not None and event.is_set():
+            stop_event = _STOP_EVENTS.get(job_id)
+            pause_event = _PAUSE_EVENTS.get(job_id)
+
+            if stop_event is not None and stop_event.is_set():
                 scan_store.mark_stopped(job_id)
                 log.info("scan %s: stopped by request at %d/%d",
                          job_id, n - 1, len(symbols))
                 return
+
+            if pause_event is not None and pause_event.is_set():
+                scan_store.mark_paused(job_id)
+                log.info("scan %s: paused before symbol %s", job_id, symbol)
+                while pause_event.is_set():
+                    if stop_event is not None and stop_event.is_set():
+                        scan_store.mark_stopped(job_id)
+                        return
+                    time.sleep(0.25)
+                scan_store.mark_running(job_id)
+                log.info("scan %s: resumed", job_id)
+
             scan_store.update_progress(job_id, current_symbol=symbol)
-            t0 = time.perf_counter()
             row = _scan_symbol(symbol, timeframe)
+
             if row["error"]:
                 failed += 1
             elif row["signal_fired"]:
                 fired += 1
             else:
                 skipped += 1
+
             scan_store.add_result(job_id, row)
             done += 1
-            scan_store.update_progress(job_id, symbols_done=done, signals_fired=fired,
-                                       skipped=skipped, failed=failed)
-            outcome = ("FAILED" if row["error"] else
-                       "SIGNAL" if row["signal_fired"] else
-                       f"skip:{row['skip_reason']}")
-            log.info("scan %s: %d/%d %s -> %s (%.1fs)", job_id, n, len(symbols),
-                     symbol, outcome, time.perf_counter() - t0)
+            scan_store.update_progress(job_id, symbols_done=done,
+                                       signals_fired=fired,
+                                       skipped=skipped,
+                                       failed=failed)
+
             if n < len(symbols):
                 time.sleep(SYMBOL_PAUSE_SECONDS)
+                if _STOP_EVENTS.get(job_id) and _STOP_EVENTS[job_id].is_set():
+                    scan_store.mark_stopped(job_id)
+                    return
+
         scan_store.mark_done(job_id)
-        log.info("scan %s: done - %d analysed, %d signals, %d skipped, %d failed",
-                 job_id, done, fired, skipped, failed)
     except Exception:
         log.error("scan job %s failed:\n%s", job_id, traceback.format_exc())
         scan_store.mark_error(job_id, traceback.format_exc())
     finally:
         _STOP_EVENTS.pop(job_id, None)
+        _PAUSE_EVENTS.pop(job_id, None)
         if _SCAN_LOCK.locked():
             _SCAN_LOCK.release()
 

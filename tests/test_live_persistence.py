@@ -76,7 +76,7 @@ def main():
             "4H": slice_up_to(df_4h, ts),
             "1H": df_1h.iloc[max(0, pos + 1 - H1_WINDOW):pos + 1],
         }
-        result = live_runner.run_analysis(df_by_tf, execution_tf="1H")
+        result = live_runner.run_analysis(df_by_tf, execution_tf="1H", symbol="BTCUSDT")
         if "skipped" not in result:
             signals += 1
 

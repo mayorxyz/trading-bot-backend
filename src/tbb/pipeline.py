@@ -52,6 +52,7 @@ from tbb.indicators.fibonacci import analyze_fibonacci
 from tbb.engines.breakout_engine import analyze_breakout
 from tbb.engines.elliott_wave import analyze_elliott_wave
 from tbb.engines.structure_retest import analyze_structure_retest
+from tbb.engines import entry_generators as entry_gen
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +519,8 @@ def analyze_pair_with_bias(pair, timeframe, df_by_tf,
     prepared = _memo_get(prep_key)
     if prepared is None:
         prepared = _prepare_candidate(
-            opens, highs, lows, closes, volumes, bias["direction"])
+            opens, highs, lows, closes, volumes, bias["direction"],
+            df_by_tf=df_by_tf)
         _memo_put(prep_key, prepared)
     if "skip" in prepared:
         return {"skipped": prepared["skip"]}
@@ -572,7 +574,8 @@ def analyze_pair_with_bias(pair, timeframe, df_by_tf,
     )
 
 
-def _prepare_candidate(opens, highs, lows, closes, volumes, direction):
+def _prepare_candidate(opens, highs, lows, closes, volumes, direction,
+                       df_by_tf=None):
     """
     Cheap structural path shared by analyze_pair: swings -> S/R -> entry ->
     SL/TP -> validity. Returns a context dict on success or {"skip": reason}
@@ -580,6 +583,11 @@ def _prepare_candidate(opens, highs, lows, closes, volumes, direction):
 
     Split out so the bias wrapper can reject dead windows BEFORE paying for
     the engine stack, and so the result can be memoized per window.
+
+    df_by_tf is optional and read-only: the HTF frames the caller already holds,
+    forwarded unchanged to the entry-generator context. Callers that do not have
+    it (analyze_pair's legacy path, backtest helpers) simply omit it — nothing
+    that reads the returned ctx sees a change.
     """
     swings = get_zigzag_swings(highs, lows, closes)
     sr_levels = find_sr_levels(swings)
@@ -594,9 +602,25 @@ def _prepare_candidate(opens, highs, lows, closes, volumes, direction):
     current_price = closes[-1]
     atr = float(talib.ATR(np.array(highs), np.array(lows), np.array(closes), timeperiod=14)[-1])
 
-    entry_result = find_best_entry(current_price, direction, sr_levels)
-    if entry_result is None:
-        return {"skip": "no qualifying entry level found"}
+    # Entry selection. The flag is read HERE, at call time (never at import).
+    # Only a NON-default ENTRY_GENERATORS selection routes through the generator
+    # framework; with the default "sr_retest" the exact same find_best_entry()
+    # call runs as before, so the default regression holds by construction.
+    active_generators = entry_gen.enabled_generators()
+    if active_generators and active_generators != [entry_gen.DEFAULT_GENERATORS]:
+        gen_ctx = entry_gen.GeneratorContext(
+            current_price, direction, opens, highs, lows, closes, volumes,
+            swings, sr_levels, atr, df_by_tf=df_by_tf)
+        merged = entry_gen.resolve_entry(gen_ctx, names=active_generators)
+        entry_result = entry_gen.to_entry_result(merged)
+        if entry_result is None:
+            return {"skip": "no qualifying entry level found"}
+        entry_method = list(merged.get("methods") or [entry_gen.DEFAULT_GENERATORS])
+    else:
+        entry_result = find_best_entry(current_price, direction, sr_levels)
+        if entry_result is None:
+            return {"skip": "no qualifying entry level found"}
+        entry_method = [entry_gen.DEFAULT_GENERATORS]
 
     trade = get_trade_levels(
         entry_result["entry_price"], direction, atr, swings, sr_levels
@@ -619,6 +643,7 @@ def _prepare_candidate(opens, highs, lows, closes, volumes, direction):
         "volume_spikes": len(vol_spikes),
         "volume_divergences": len(vol_div),
         "level_touches": entry_result["level_touches"],
+        "entry_method": entry_method,
         "trade": trade,
         "wick_at_entry": any(w["index"] >= last_idx - 2 for w in wick_hits),
         "volume_confirm": any(v["index"] >= last_idx - 2 for v in vol_spikes),
@@ -682,6 +707,7 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
             "skipped": f"low conviction: confluence {score_result['score']}/100 "
                        f"below required {min_confluence_score}",
             "confluence_breakdown": score_result["breakdown"],
+            "entry_method": ctx.get("entry_method", [entry_gen.DEFAULT_GENERATORS]),
             "chart_pattern": chart_pattern_info,
             "retracement": retracement_info,
             "fibonacci": fib_info,
@@ -724,6 +750,7 @@ def analyze_pair(pair, timeframe, opens, highs, lows, closes, volumes,
         "direction": direction,
         "entry": trade["entry"],
         "entry_level_touches": ctx["level_touches"],
+        "entry_method": ctx.get("entry_method", [entry_gen.DEFAULT_GENERATORS]),
         "sl": trade["sl"]["sl_price"],
         "sl_method": trade["sl"]["method"],
         "tp": trade["tp"]["tp_price"],

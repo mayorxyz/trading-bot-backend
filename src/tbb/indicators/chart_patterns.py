@@ -31,7 +31,6 @@ Pattern dict contract:
         "touches":         int   â€” key-level touch count
         "points":          list of defining swings [{"index","price","type"}]
     }
-
 detect_chart_patterns() runs every detector over the last `lookback` bars and
 returns a report dict with all matches sorted most-recent first.
 """
